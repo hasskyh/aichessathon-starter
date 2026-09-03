@@ -40,7 +40,8 @@ MAX_DEPTH = 64
 # clock at. Counting down to a checkpoint beats a modulo on every node.
 CHECK_INTERVAL = 2048.0
 
-STACK = np.zeros((MAX_PLY + 1, 2, 256), dtype=np.int32)  # the NNUE accumulator stack
+MAX_PLY = 64
+_stack = np.zeros((MAX_PLY + 1, 2, 256), dtype=np.int32) # The acc stack
 
 @njit(cache=False)
 def _now() -> float:
@@ -126,7 +127,6 @@ def quiescence(
     scores: np.ndarray,
     hist: np.ndarray,
     ctrl: np.ndarray,
-    stack: np.ndarray,
 ) -> int:
     if _tick(ctrl):
         return 0
@@ -160,7 +160,7 @@ def quiescence(
         move = buf[ply, i]
         make_move(bb, sq, st, move, hist, ply)
         score = -quiescence(
-            bb, sq, st, -beta, -alpha, qdepth - 1, ply + 1, buf, scores, hist, ctrl, stack
+            bb, sq, st, -beta, -alpha, qdepth - 1, ply + 1, buf, scores, hist, ctrl
         )
         unmake_move(bb, sq, st, move, hist, ply)
         if ctrl[2] != 0.0:
@@ -187,7 +187,6 @@ def negamax(
     scores: np.ndarray,
     hist: np.ndarray,
     ctrl: np.ndarray,
-    stack: np.ndarray,
 ) -> int:
     if _tick(ctrl):
         return 0
@@ -195,7 +194,7 @@ def negamax(
         # Quiescence returns the same mate and stalemate scores, so handing off before
         # generating avoids generating this node's moves twice.
         return quiescence(
-            bb, sq, st, alpha, beta, QUIESCE_DEPTH, ply, buf, scores, hist, ctrl, stack
+            bb, sq, st, alpha, beta, QUIESCE_DEPTH, ply, buf, scores, hist, ctrl
         )
 
     count, checkers = gen_moves_ex(bb, st, buf[ply], 0)
@@ -210,7 +209,7 @@ def negamax(
         move = buf[ply, i]
         make_move(bb, sq, st, move, hist, ply)
         score = -negamax(
-            bb, sq, st, -beta, -alpha, depth - 1, ply + 1, buf, scores, hist, ctrl, stack
+            bb, sq, st, -beta, -alpha, depth - 1, ply + 1, buf, scores, hist, ctrl
         )
         unmake_move(bb, sq, st, move, hist, ply)
         if ctrl[2] != 0.0:
@@ -232,7 +231,6 @@ def think(
     scores: np.ndarray,
     hist: np.ndarray,
     ctrl: np.ndarray,
-    stack: np.ndarray,
     max_depth: int,
 ) -> tuple[int, int, int]:
     """Iterative deepening. Returns the chosen move, the depth it survived, its score.
@@ -259,7 +257,7 @@ def think(
         for move in [pv] + [m for m in moves if m != pv]:
             make_move(bb, sq, st, move, hist, 0)
             score = -negamax(
-                bb, sq, st, -INF, -best_score, depth - 1, 1, buf, scores, hist, ctrl, stack
+                bb, sq, st, -INF, -best_score, depth - 1, 1, buf, scores, hist, ctrl
             )
             unmake_move(bb, sq, st, move, hist, 0)
             if ctrl[2] != 0.0:
@@ -295,7 +293,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
     CTRL[1] = 0.0
     CTRL[2] = 0.0
     CTRL[3] = CHECK_INTERVAL
-    move, depth, _score = think(bb, sq, st, BUF, SCORES, HIST, CTRL, STACK, MAX_DEPTH)
+    move, depth, _score = think(bb, sq, st, BUF, SCORES, HIST, CTRL, MAX_DEPTH)
     last_depth = depth
     last_nodes = CTRL[1]
     if move < 0:
@@ -319,7 +317,7 @@ def _warm() -> None:
     gen_moves(bb, st, BUF[0], 0)
     move = np.int32(BUF[0, 0])
     make_move(bb, sq, st, move, HIST, 0)
-    negamax(bb, sq, st, -INF, INF, 1, 1, BUF, SCORES, HIST, CTRL, STACK)
+    negamax(bb, sq, st, -INF, INF, 1, 1, BUF, SCORES, HIST, CTRL)
     unmake_move(bb, sq, st, move, HIST, 0)
 
 

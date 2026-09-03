@@ -59,7 +59,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
     best: list[chess.Move] = []
     for move in board.legal_moves:
         board.push(move)
-        score = -negamax(board, 1)
+        score = -negamax(board, 3)
         board.pop()
         if score > best_score:
             best_score = score

@@ -1,0 +1,51 @@
+import json
+import chess
+import numpy as np
+import features
+
+def process_position(fen, cp, i):
+    board = chess.Board(fen)
+    white_row, black_row = features.active(board)
+    if board.turn == chess.WHITE:
+        mover, opponent = white_row, black_row
+    else:
+        mover, opponent = black_row, white_row
+    mover_padded = np.full(32, -1, dtype=np.int16)
+    mover_padded[: len(mover)] = mover
+    opponent_padded = np.full(32, -1, dtype=np.int16)
+    opponent_padded[: len(opponent)] = opponent
+    idx[i, 0] = mover_padded
+    idx[i, 1] = opponent_padded
+    target[i] = 1/ (1+ np.exp(-cp / 400))
+    i += 1
+    return i
+
+with open("./data/raw.jsonl", "r", encoding="utf-8") as file:
+    n = sum(1 for _ in file)
+    idx = np.full((n, 2, 32), -1, dtype=np.int16)
+    target = np.zeros(n, dtype=np.float32)
+    i = 0
+    for line_number, line in enumerate(file, 1):
+                # Skip blank lines
+                line = line.strip()
+                if not line:
+                    continue
+
+                try:
+                    data = json.loads(line)
+                    
+                    # Extract fields
+                    fen = data["fen"]
+                    cp = data["cp"]
+
+                    try:
+                        i = process_position(fen, cp, i)
+                    except:
+                        print("Failed to process. fen is ", fen, " and cp is ", cp)
+
+                except json.JSONDecodeError as e:
+                    print(f"Skipping invalid JSON on line {line_number}: {e}")
+                except KeyError as e:
+                    print(f"Missing expected key {e} on line {line_number}")
+
+np.savez("data/train.npz", idx=idx, target=target)

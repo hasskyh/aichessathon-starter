@@ -2,14 +2,25 @@
 
     uv run python -m harness.uci --agent .
 
-The agent still runs inside the platform's runner, one process per game, so its
+The agent runs inside the platform's runner, one process per game, so its
 print() output cannot reach the UCI stream and its state is discarded on
 ucinewgame exactly as it is between rated games.
+
+Set AICHESS_UCI_LOG to a file path to record every protocol line in both
+directions. That is the only reliable way to see what a GUI actually sent when
+it misbehaves.
+
+This is not the referee. A crash or an illegal move here does not lose the
+game: when the position has a legal move the engine plays one and says so with
+an info string, because a GUI given no move just hangs. harness/referee.py, not
+this file, is how the platform would rule your agent.
 """
 
 import argparse
 import itertools
+import os
 import sys
+import time
 from pathlib import Path
 
 import chess
@@ -21,6 +32,7 @@ DEFAULT_BUDGET_MS = 60_000
 NO_MOVE = "0000"
 # a search started with either of these must not answer until stop or ponderhit
 HELD = frozenset({"infinite", "ponder"})
+LOG_PATH = os.environ.get("AICHESS_UCI_LOG", "")
 
 
 def main() -> None:
@@ -43,7 +55,9 @@ class Engine:
         self.pending: str | None = None
 
     def run(self) -> None:
+        _log("--", f"engine up, serving {self.directory}")
         for line in sys.stdin:
+            _log(">>", line.rstrip())
             command, _, rest = line.strip().partition(" ")
             if command == "uci":
                 self._identify()
@@ -62,19 +76,7 @@ class Engine:
             elif command == "quit":
                 break
         self._shutdown()
-
-    def _go(self, rest: str) -> None:
-        best = self._best(_budget_ms(rest, self.board.turn))
-        if HELD.isdisjoint(rest.split()):
-            _send(f"bestmove {best}")
-        else:
-            self.pending = best
-
-    def _flush(self) -> None:
-        if self.pending is None:
-            return
-        pending, self.pending = self.pending, None
-        _send(f"bestmove {pending}")
+        _log("--", "engine down")
 
     def _identify(self) -> None:
         _send(f"id name {self.name}")
@@ -99,18 +101,38 @@ class Engine:
         for uci in moves:
             self.board.push(chess.Move.from_uci(uci))
 
+    def _go(self, rest: str) -> None:
+        best = self._best(_budget_ms(rest, self.board.turn))
+        if HELD.isdisjoint(rest.split()):
+            _send(f"bestmove {best}")
+        else:
+            self.pending = best
+
+    def _flush(self) -> None:
+        if self.pending is None:
+            return
+        pending, self.pending = self.pending, None
+        _send(f"bestmove {pending}")
+
     def _best(self, budget_ms: int) -> str:
         try:
             uci = self._running().move(self.board.fen(), budget_ms)
         except AgentFailure as failure:
-            _send(f"info string the agent failed to {failure.reason}")
             self._shutdown()
-            return NO_MOVE
+            return self._fallback(f"the agent failed to {failure.reason}")
         move = _legal(self.board, uci)
         if move is None:
-            _send(f"info string the agent returned an illegal move: {uci!r}")
-            return NO_MOVE
+            return self._fallback(f"the agent returned an illegal move: {uci!r}")
         return move.uci()
+
+    def _fallback(self, reason: str) -> str:
+        _send(f"info string {reason}")
+        legal = next(iter(self.board.legal_moves), None)
+        if legal is None:
+            _send("info string the position is already over, so there is no move to make")
+            return NO_MOVE
+        _send(f"info string playing {legal.uci()} so the game can continue")
+        return legal.uci()
 
     def _running(self) -> Agent:
         if self.agent is None:
@@ -150,8 +172,16 @@ def _legal(board: chess.Board, uci: str) -> chess.Move | None:
 
 
 def _send(message: str) -> None:
+    _log("<<", message)
     sys.stdout.write(message + "\n")
     sys.stdout.flush()
+
+
+def _log(direction: str, message: str) -> None:
+    if not LOG_PATH:
+        return
+    with open(LOG_PATH, "a", encoding="utf-8") as stream:
+        stream.write(f"{time.time():.3f} {direction} {message}\n")
 
 
 if __name__ == "__main__":
