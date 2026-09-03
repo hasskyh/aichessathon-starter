@@ -10,7 +10,7 @@
 set -euo pipefail
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-cd "$root/logs"
+cd "$root"
 
 if [ $# -lt 2 ]; then
     echo "usage: $(basename "$0") <agent-dir-A> <agent-dir-B> [games] [tc]" >&2

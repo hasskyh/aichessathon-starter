@@ -10,14 +10,11 @@
 # difference against invictus_quiesce is speed and nothing else.
 
 import time
-from pathlib import Path
 
 import numpy as np
 from numba import njit, objmode
 
 import bitgen
-import features
-import nnue
 from bitgen import (
     FLAG_EP,
     MAX_MOVES,
@@ -28,6 +25,10 @@ from bitgen import (
     popcount,
     unmake_move,
 )
+
+from pathlib import Path
+import features
+import nnue
 
 PIECE_VALUE = np.array([100, 320, 330, 500, 900, 0], dtype=np.int64)
 # The original scores a quiet move as if it captured a pawn, because piece_at returns
@@ -46,21 +47,11 @@ CHECK_INTERVAL = 2048.0
 STACK = np.zeros((MAX_PLY + 1, 2, 256), dtype=np.int32)  # the NNUE accumulator stack
 
 _WEIGHTS = np.load(Path(__file__).resolve().parent / "weights" / "nnue.npz")
-# np.load on an .npz can hand back a non-writable, non-C-contiguous view (W2 is
-# Fortran-ordered because export.py's transpose preserved that layout through the
-# save/load round trip); np.array() forces an independent, C-contiguous copy.
-# Separately, and not fixed by any of that: numba types a module-level global array
-# as read-only the moment it is touched inside a jitted function, regardless of the
-# array's own .flags.writeable. That is why W1..B3 are threaded through negamax,
-# quiescence and nnue_evaluate as ordinary parameters below, exactly like stack and
-# ctrl already are, rather than read directly as globals from inside jitted code.
-# think() and _warm() are plain Python, so they read the globals directly and pass
-# them onward -- the restriction only bites once you are inside nopython mode.
-W1 = np.array(_WEIGHTS["w1"])
-B1 = np.array(_WEIGHTS["b1"])
-W2 = np.array(_WEIGHTS["w2"])
-B2 = np.array(_WEIGHTS["b2"])
-W3 = np.array(_WEIGHTS["w3"])
+W1 = _WEIGHTS["w1"]
+B1 = _WEIGHTS["b1"]
+W2 = _WEIGHTS["w2"]
+B2 = _WEIGHTS["b2"]
+W3 = _WEIGHTS["w3"]
 B3 = int(_WEIGHTS["b3"])
 
 
@@ -84,10 +75,7 @@ def _tick(ctrl: np.ndarray) -> bool:
 
 @njit(inline="always", cache=False)
 def evaluate(bb: np.ndarray, st: np.ndarray, mobility: int) -> int:
-    """Material plus mobility, from the side to move's point of view.
-
-    Superseded by nnue_evaluate below; kept as a reference and for A/B testing.
-    """
+    """Material plus mobility, from the side to move's point of view."""
     us = st[0]
     them = 1 - us
     material = 0
@@ -97,24 +85,14 @@ def evaluate(bb: np.ndarray, st: np.ndarray, mobility: int) -> int:
         )
     return material + MOBILITY_WEIGHT * mobility
 
-
 @njit(inline="always", cache=False)
-def nnue_evaluate(
-    stack: np.ndarray,
-    ply: int,
-    st: np.ndarray,
-    w2: np.ndarray,
-    b2: np.ndarray,
-    w3: np.ndarray,
-    b3: int,
-) -> int:
+def nnue_evaluate(stack: np.ndarray, ply: int, st: np.ndarray) -> int:
     """NNUE score for the position at this ply, from the side to move's perspective.
 
     stack[ply] must already reflect this exact position: refreshed once at the
     root, then kept current by nnue.update at every make_move since.
     """
-    return nnue.forward(stack[ply], st[0], w2, b2, w3, b3)
-
+    return nnue.forward(stack[ply], st[0], W2, B2, W3, B3)
 
 @njit(inline="always", cache=False)
 def _order_score(sq: np.ndarray, move: int) -> int:
@@ -170,16 +148,11 @@ def quiescence(
     hist: np.ndarray,
     ctrl: np.ndarray,
     stack: np.ndarray,
-    w1: np.ndarray,
-    w2: np.ndarray,
-    b2: np.ndarray,
-    w3: np.ndarray,
-    b3: int,
 ) -> int:
     if _tick(ctrl):
         return 0
     if ply >= MAX_PLY - 2:
-        return nnue_evaluate(stack, ply, st, w2, b2, w3, b3)
+        return nnue_evaluate(stack, ply, st)
 
     count, checkers = gen_moves_ex(bb, st, buf[ply], 0)
     if count == 0:
@@ -190,7 +163,7 @@ def quiescence(
         best = -INF
         ordered = False
     else:
-        best = nnue_evaluate(stack, ply, st, w2, b2, w3, b3)
+        best = nnue_evaluate(stack, ply, st)
         if best >= beta or qdepth == 0:
             return best
         if best > alpha:
@@ -209,10 +182,9 @@ def quiescence(
         off, on = features.deltas_bb(sq, st, move)
         make_move(bb, sq, st, move, hist, ply)
         stack[ply + 1] = stack[ply]
-        nnue.update(stack[ply + 1], w1, off, on)
+        nnue.update(stack[ply + 1], W1, off, on)
         score = -quiescence(
-            bb, sq, st, -beta, -alpha, qdepth - 1, ply + 1, buf, scores, hist, ctrl,
-            stack, w1, w2, b2, w3, b3,
+            bb, sq, st, -beta, -alpha, qdepth - 1, ply + 1, buf, scores, hist, ctrl, stack
         )
         unmake_move(bb, sq, st, move, hist, ply)
         if ctrl[2] != 0.0:
@@ -240,11 +212,6 @@ def negamax(
     hist: np.ndarray,
     ctrl: np.ndarray,
     stack: np.ndarray,
-    w1: np.ndarray,
-    w2: np.ndarray,
-    b2: np.ndarray,
-    w3: np.ndarray,
-    b3: int,
 ) -> int:
     if _tick(ctrl):
         return 0
@@ -252,8 +219,7 @@ def negamax(
         # Quiescence returns the same mate and stalemate scores, so handing off before
         # generating avoids generating this node's moves twice.
         return quiescence(
-            bb, sq, st, alpha, beta, QUIESCE_DEPTH, ply, buf, scores, hist, ctrl,
-            stack, w1, w2, b2, w3, b3,
+            bb, sq, st, alpha, beta, QUIESCE_DEPTH, ply, buf, scores, hist, ctrl, stack
         )
 
     count, checkers = gen_moves_ex(bb, st, buf[ply], 0)
@@ -269,10 +235,9 @@ def negamax(
         off, on = features.deltas_bb(sq, st, move)
         make_move(bb, sq, st, move, hist, ply)
         stack[ply + 1] = stack[ply]
-        nnue.update(stack[ply + 1], w1, off, on)
+        nnue.update(stack[ply + 1], W1, off, on)
         score = -negamax(
-            bb, sq, st, -beta, -alpha, depth - 1, ply + 1, buf, scores, hist, ctrl,
-            stack, w1, w2, b2, w3, b3,
+            bb, sq, st, -beta, -alpha, depth - 1, ply + 1, buf, scores, hist, ctrl, stack
         )
         unmake_move(bb, sq, st, move, hist, ply)
         if ctrl[2] != 0.0:
@@ -323,10 +288,9 @@ def think(
             off, on = features.deltas_bb(sq, st, move)
             make_move(bb, sq, st, move, hist, 0)
             stack[1] = stack[0]
-            nnue.update(stack[1], W1, off, on)
+            nnue.update(stack[ply + 1], W1, off, on)
             score = -negamax(
-                bb, sq, st, -INF, -best_score, depth - 1, 1, buf, scores, hist, ctrl,
-                stack, W1, W2, B2, W3, B3,
+                bb, sq, st, -INF, -best_score, depth - 1, 1, buf, scores, hist, ctrl, stack
             )
             unmake_move(bb, sq, st, move, hist, 0)
             if ctrl[2] != 0.0:
@@ -374,10 +338,9 @@ def _warm() -> None:
     """Compile the search at import, where the 60 second init budget pays for it.
 
     One negamax call at depth 2 pulls in the whole jitted tree: quiescence, evaluate,
-    the ordering helpers, bitgen's generation and make/unmake at the int32 move type
-    the search really uses, and the NNUE path (refresh, update, forward) at the real
-    weight shapes. Argument types must match the real call exactly, or numba compiles
-    a second specialisation later, on the clock.
+    the ordering helpers, and bitgen's generation and make/unmake at the int32 move
+    type the search really uses. Argument types must match the real call exactly, or
+    numba compiles a second specialisation later, on the clock.
     """
     bb, sq, st = bitgen.from_fen(bitgen.STARTING_FEN)
     CTRL[0] = time.monotonic() + 60.0
@@ -392,8 +355,9 @@ def _warm() -> None:
     make_move(bb, sq, st, move, HIST, 0)
     STACK[1] = STACK[0]
     nnue.update(STACK[1], W1, off, on)
-    negamax(bb, sq, st, -INF, INF, 1, 1, BUF, SCORES, HIST, CTRL, STACK, W1, W2, B2, W3, B3)
+    negamax(bb, sq, st, -INF, INF, 1, 1, BUF, SCORES, HIST, CTRL, STACK)
     unmake_move(bb, sq, st, move, HIST, 0)
+
 
 
 _warm()
