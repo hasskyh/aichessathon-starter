@@ -118,6 +118,12 @@ def main() -> None:
     parser.add_argument("--rows", type=int, default=KEPT_ROWS)
     parser.add_argument("--hidden", type=int, default=HIDDEN)
     parser.add_argument("--tag", type=str, default="", help="checkpoint filename suffix, e.g. 512")
+    parser.add_argument(
+        "--resume", type=Path, default=None, help="checkpoint to continue training from"
+    )
+    parser.add_argument(
+        "--start-epoch", type=int, default=1, help="epoch number to label the first new checkpoint"
+    )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=8192)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -135,12 +141,16 @@ def main() -> None:
     print(f"{len(train_ids):,} train rows, {len(val_ids):,} validation rows")
 
     model = NNUE(hidden=arguments.hidden)
+    if arguments.resume is not None:
+        model.load_state_dict(torch.load(arguments.resume, map_location="cpu"))
+        print(f"resumed from {arguments.resume}")
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=arguments.lr, weight_decay=arguments.weight_decay
     )
 
     checkpoint_dir = Path(__file__).parent
-    for epoch in range(1, arguments.epochs + 1):
+    last_epoch = arguments.start_epoch + arguments.epochs - 1
+    for epoch in range(arguments.start_epoch, last_epoch + 1):
         train_loss = run_epoch(
             model, optimizer, idx, target, train_ids, arguments.batch_size, train=True
         )
