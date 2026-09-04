@@ -42,9 +42,12 @@ def quantize(model: NNUE) -> dict[str, np.ndarray]:
     w1 = np.clip(
         np.round(embedding[:FEATURES] * ACT_MAX / ACCUMULATOR_NORM), -32768, 32767
     ).astype(np.int16)
-    # derived from the model, not nnue.py's HIDDEN constant: this file must export
-    # correctly whatever size was actually trained, matching hidden.
-    b1 = np.zeros(model.transformer.embedding_dim, dtype=np.int16)
+    # bias1 is added to the raw per-perspective sum before the same /ACCUMULATOR_NORM
+    # division and clamp as the embedding weights (see train.py's forward()), so it is
+    # scaled identically to w1 here.
+    b1 = np.clip(
+        np.round(model.bias1.detach().numpy() * ACT_MAX / ACCUMULATOR_NORM), -32768, 32767
+    ).astype(np.int16)
 
     w2 = np.clip(
         np.round(model.hidden.weight.detach().numpy().T * WEIGHT_SCALE), -127, 127
