@@ -52,7 +52,8 @@ if [ "$na" = "$nb" ]; then
     nb="$nb-2"
 fi
 
-pgn=$root/compare-$na-vs-$nb.pgn
+mkdir -p "$root/logs"
+pgn=$root/logs/compare-$na-vs-$nb.pgn
 echo "$na vs $nb   |   $games games   |   tc=$tc   |   concurrency=$concurrency"
 echo
 "$cli" \

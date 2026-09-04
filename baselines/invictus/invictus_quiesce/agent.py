@@ -119,7 +119,17 @@ def get_move(fen: str, time_left_ms: int) -> str:
         try:
             for move in _pv_first(moves, pv_move):
                 board.push(move)
-                score = -negamax(-math.inf, -best_score, board, depth - 1)
+                # Every root move must be searched with a full (-inf, +inf) window.
+                # The previous version passed (-inf, -best_score), which narrows beta
+                # as best_score improves through the move loop. A move that then hits
+                # that narrowed beta returns early with a fail-high bound -- "at least
+                # this good", not its true score -- and that bound was being compared
+                # directly against other moves' *exact* scores as if it were one too.
+                # A late move could look worse than it truly is (or a bad move look
+                # better) purely because of when it happened to be searched, not its
+                # actual merit -- observed directly as the same position scoring
+                # +100 / -144 / +104 at consecutive depths instead of converging.
+                score = -negamax(-math.inf, math.inf, board, depth - 1)
                 board.pop()
                 if score > best_score:
                     best_score = score
