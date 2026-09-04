@@ -54,7 +54,6 @@ for game_num in range(n_games):
             break
         move = random.choice(legal)
 
-        # find the matching bitgen move int by uci round-trip
         count = bitgen.gen_moves(bb, st, BUF[0], 0)
         bb_move = None
         for i in range(count):
@@ -69,42 +68,35 @@ for game_num in range(n_games):
             n_mismatches += 1
             break
 
-        is_king_move = sq[bb_move & 63] % 6 == bitgen.KING
-        if not is_king_move:
-            off, on = fk.halfkp_deltas_bb(sq, st, bb_move, wk, bk)
-            off_c, on_c, wr, br = fk.halfkp_deltas(board, move)
-            n_delta_checks += 1
-            if wr or br:
-                print(
-                    f"MISMATCH (refresh flag disagreement, bb says no king "
-                    f"move but chess says yes): game {game_num} ply {ply} "
-                    f"move {move.uci()}"
-                )
-                n_mismatches += 1
-            else:
-                ok_off_w = rows_match(off_c[0], off[0])
-                ok_off_b = rows_match(off_c[1], off[1])
-                ok_on_w = rows_match(on_c[0], on[0])
-                ok_on_b = rows_match(on_c[1], on[1])
-                if not (ok_off_w and ok_off_b and ok_on_w and ok_on_b):
-                    print(
-                        f"MISMATCH (deltas) game {game_num} ply {ply} "
-                        f"move {move.uci()} fen={board.fen()}"
-                    )
-                    print("  off chess:", off_c, "off bb:", off)
-                    print("  on  chess:", on_c, "on  bb:", on)
-                    n_mismatches += 1
-        else:
-            _, _, wr, br = fk.halfkp_deltas(board, move)
-            if not (wr or br):
-                print(f"MISMATCH (refresh flag disagreement, bb says king move but chess says no): "
-                      f"game {game_num} ply {ply} move {move.uci()}")
-                n_mismatches += 1
+        off, on = fk.halfkp_deltas_bb(sq, st, bb_move, wk, bk)
+        off_c, on_c, wr, br = fk.halfkp_deltas(board, move)
+        n_delta_checks += 1
+
+        bb_is_king_move = sq[bb_move & 63] % 6 == bitgen.KING
+        if bb_is_king_move != (wr or br):
+            print(
+                f"MISMATCH (refresh flag disagreement): game {game_num} ply {ply} "
+                f"move {move.uci()} bb_king_move={bb_is_king_move} chess wr={wr} br={br}"
+            )
+            n_mismatches += 1
+
+        ok_off_w = rows_match(off_c[0], off[0])
+        ok_off_b = rows_match(off_c[1], off[1])
+        ok_on_w = rows_match(on_c[0], on[0])
+        ok_on_b = rows_match(on_c[1], on[1])
+        if not (ok_off_w and ok_off_b and ok_on_w and ok_on_b):
+            print(
+                f"MISMATCH (deltas) game {game_num} ply {ply} "
+                f"move {move.uci()} fen={board.fen()} king_move={bb_is_king_move}"
+            )
+            print("  off chess:", off_c.tolist(), "off bb:", off.tolist())
+            print("  on  chess:", on_c.tolist(), "on  bb:", on.tolist())
+            n_mismatches += 1
 
         board.push(move)
         bitgen.make_move(bb, sq, st, bb_move, HIST, 0)
 
-        if is_king_move:
+        if bb_is_king_move:
             wk, bk = fk.find_king_squares(sq)
 
         if not check_active(board, sq, wk, bk, f"game {game_num} ply {ply}"):
@@ -112,6 +104,6 @@ for game_num in range(n_games):
         n_positions += 1
 
 print(
-    f"{n_positions} positions checked, "
-    f"{n_delta_checks} delta checks, {n_mismatches} mismatches"
+    f"\n{n_positions} positions checked, {n_delta_checks} delta checks, "
+    f"{n_mismatches} mismatches"
 )
