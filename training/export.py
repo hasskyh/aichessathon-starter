@@ -24,7 +24,13 @@ OUTPUT_SCALE = ACT_MAX * WEIGHT_SCALE   # 8128
 
 def load_checkpoint(path: Path, hidden: int) -> NNUE:
     model = NNUE(hidden=hidden)
-    model.load_state_dict(torch.load(path, map_location="cpu"))
+    # strict=False: checkpoints trained before bias1 existed have no such key.
+    # Reported explicitly rather than silently accepted -- a real, unexpected
+    # mismatch here should be just as loud as it would be with strict=True.
+    result = model.load_state_dict(torch.load(path, map_location="cpu"), strict=False)
+    if result.missing_keys or result.unexpected_keys:
+        print(f"  load_state_dict: missing={result.missing_keys} "
+              f"unexpected={result.unexpected_keys}")
     return model.eval()
 
 

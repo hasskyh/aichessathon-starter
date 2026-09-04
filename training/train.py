@@ -36,12 +36,19 @@ class NNUE(nn.Module):
     def __init__(self, hidden: int = HIDDEN) -> None:
         super().__init__()
         self.transformer = nn.EmbeddingBag(FEATURES + 1, hidden, mode="sum", padding_idx=FEATURES)
+        # EmbeddingBag has no bias of its own; nnue.py's refresh() initialises the
+        # runtime accumulator from b1 before summing feature rows, so the model
+        # needs a matching learned bias or it can never express one. Added to each
+        # perspective's raw sum, before the /ACCUMULATOR_NORM division, so it lives
+        # in the same units as the embedding weights and export.py can scale it the
+        # same way (round(bias1 * ACT_MAX / ACCUMULATOR_NORM), matching w1).
+        self.bias1 = nn.Parameter(torch.zeros(hidden))
         self.hidden = nn.Linear(2 * hidden, OUTPUTS)
         self.output = nn.Linear(OUTPUTS, 1)
 
     def forward(self, mover_idx: Tensor, opponent_idx: Tensor) -> Tensor:
-        mover_vec = self.transformer(mover_idx)
-        opponent_vec = self.transformer(opponent_idx)
+        mover_vec = self.transformer(mover_idx) + self.bias1
+        opponent_vec = self.transformer(opponent_idx) + self.bias1
 
         x = torch.cat([mover_vec, opponent_vec], dim=1) / ACCUMULATOR_NORM
         x = torch.clamp(x, 0.0, 1.0)
@@ -78,8 +85,9 @@ def saturation(model: NNUE, idx: np.memmap, target: np.memmap, ids: np.ndarray) 
     so a bad run shows up in minutes, not after the full 40-minute training job."""
     mover, opponent, _ = prepare_batch(idx, target, ids[:4000])
     with torch.no_grad():
-        pre = torch.cat([model.transformer(mover), model.transformer(opponent)], dim=1)
-        pre = pre / ACCUMULATOR_NORM
+        mover_vec = model.transformer(mover) + model.bias1
+        opponent_vec = model.transformer(opponent) + model.bias1
+        pre = torch.cat([mover_vec, opponent_vec], dim=1) / ACCUMULATOR_NORM
     return float(((pre < 0.0) | (pre > 1.0)).float().mean())
 
 
