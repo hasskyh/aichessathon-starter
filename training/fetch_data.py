@@ -25,13 +25,61 @@ lines already written to --out.
 """
 
 import argparse
+import hashlib
 import json
+import math
 import sys
 from pathlib import Path
 
 import chess
 
 CP_CLAMP = 2000
+
+
+class BloomFilter:
+    """Fixed-memory approximate membership test, in place of a plain set[str].
+
+    A set[str] grows without bound across a run this large: at the 250M-position
+    scale this project fetches at, that is hundreds of millions of live Python
+    string objects, and it exhausted this machine's memory (3.7 GB RAM, 1 GB swap)
+    well before the fetch could finish -- observed directly, swap usage climbed to
+    75% within the first ~15-20M kept positions alone, and was still climbing. A
+    Bloom filter's bit array is a fixed size chosen up front from the expected item
+    count, so memory never grows no matter how long the run goes.
+
+    The cost is a small, tunable false-positive rate: a brand-new position
+    occasionally, wrongly, treated as already seen and skipped. That is free here --
+    one lost row out of an eventual quarter-billion is not a correctness problem the
+    way silently exhausting memory and crashing the whole fetch is.
+
+    might_contain() and add() are separate, matching the set[str] they replace:
+    the caller checks early and cheaply (a duplicate of an already-kept position
+    should never pay for a board reconstruction it's just going to throw away), and
+    only commits the add once a position survives every other filter -- exactly the
+    dedup_key()-then-later-seen.add() split main() already had.
+    """
+
+    def __init__(self, expected_items: int, false_positive_rate: float = 0.01) -> None:
+        self.size = max(
+            8, int(-expected_items * math.log(false_positive_rate) / (math.log(2) ** 2))
+        )
+        self.hash_count = max(1, round((self.size / expected_items) * math.log(2)))
+        self.bits = bytearray(self.size // 8 + 1)
+
+    def _indexes(self, key: str) -> list[int]:
+        # Double hashing: two independent-enough hashes from one digest simulate
+        # hash_count hash functions without actually computing that many.
+        digest = hashlib.blake2b(key.encode(), digest_size=16).digest()
+        h1 = int.from_bytes(digest[:8], "little")
+        h2 = int.from_bytes(digest[8:], "little")
+        return [(h1 + i * h2) % self.size for i in range(self.hash_count)]
+
+    def might_contain(self, key: str) -> bool:
+        return all(self.bits[i // 8] & (1 << (i % 8)) for i in self._indexes(key))
+
+    def add(self, key: str) -> None:
+        for i in self._indexes(key):
+            self.bits[i // 8] |= 1 << (i % 8)
 
 
 def best_move_uci(position: dict) -> str | None:
@@ -75,7 +123,7 @@ def main() -> None:
     parser.add_argument("--progress-every", type=int, default=500_000)
     arguments = parser.parse_args()
 
-    seen: set[str] = set()
+    seen = BloomFilter(expected_items=arguments.limit)
     kept = read = malformed = duplicate = in_check = capture = 0
 
     with arguments.out.open("w", encoding="utf-8") as out:
@@ -97,7 +145,7 @@ def main() -> None:
                 continue
 
             key = dedup_key(fen)
-            if key in seen:
+            if seen.might_contain(key):
                 duplicate += 1
                 continue
 
