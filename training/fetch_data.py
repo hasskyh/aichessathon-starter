@@ -187,6 +187,12 @@ def main() -> None:
         "--limit", type=int, default=5_000_000, help="cumulative positions to keep"
     )
     parser.add_argument(
+        "--expected-positions", type=int, default=None,
+        help="sizes the Bloom filter; defaults to --limit, but --limit set high as an "
+        "effectively-unlimited cap must NOT also blow up the filter's memory -- pass "
+        "this separately with a realistic estimate when --limit is just a safety cap",
+    )
+    parser.add_argument(
         "--append", action="store_true", help="resume: append instead of overwrite"
     )
     parser.add_argument(
@@ -202,10 +208,11 @@ def main() -> None:
     lines_to_skip = state["lines_read"]
     kept_total = state["kept_total"]
 
+    expected_positions = arguments.expected_positions or arguments.limit
     if arguments.bloom_state is not None and arguments.bloom_state.exists():
-        seen = BloomFilter.load(arguments.bloom_state, expected_items=arguments.limit)
+        seen = BloomFilter.load(arguments.bloom_state, expected_items=expected_positions)
     else:
-        seen = BloomFilter(expected_items=arguments.limit)
+        seen = BloomFilter(expected_items=expected_positions)
 
     kept = read = malformed = duplicate = in_check = capture = 0
     mode = "a" if arguments.append else "w"

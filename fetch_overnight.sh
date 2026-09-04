@@ -18,11 +18,18 @@ OUT=data/raw_halfkp.jsonl
 STATE=data/fetch_state.json
 BLOOM=data/fetch_bloom.bin
 LIMIT=2000000000  # effectively unlimited: the real stop is the source running out
+# Sizes the Bloom filter ONLY -- must stay realistic, unlike LIMIT above. Setting
+# this as high as LIMIT once sized a 2+ GB bit array up front and nearly took the
+# whole machine down before the fetch had processed a single real segment. The
+# filter degrades gracefully if the true count runs past this (a higher false-
+# positive rate, a few more legitimate rows wrongly dropped as duplicates) -- safe
+# to underestimate, unlike overestimating.
+EXPECTED_POSITIONS=400000000
 
 while true; do
     echo "=== $(date '+%Y-%m-%d %H:%M:%S'): launching fetch segment ==="
     curl -sS "$URL" | zstd -dc | .venv/bin/python -m training.fetch_data \
-        --out "$OUT" --append --limit "$LIMIT" \
+        --out "$OUT" --append --limit "$LIMIT" --expected-positions "$EXPECTED_POSITIONS" \
         --state "$STATE" --bloom-state "$BLOOM" \
         --progress-every 5000000
     curl_status=${PIPESTATUS[0]}
