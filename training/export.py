@@ -49,9 +49,14 @@ def quantize(model: NNUE) -> dict[str, np.ndarray]:
         np.round(model.bias1.detach().numpy() * ACT_MAX / ACCUMULATOR_NORM), -32768, 32767
     ).astype(np.int16)
 
-    w2 = np.clip(
+    # .T is a view with reversed strides (Fortran order), not a copy -- every
+    # downstream op here (round, clip, astype) preserves that layout rather than
+    # fixing it, so without ascontiguousarray this ships as column-major data:
+    # correct values, but every row access in nnue.forward's hot loop strides
+    # across the whole array instead of walking contiguous memory.
+    w2 = np.ascontiguousarray(np.clip(
         np.round(model.hidden.weight.detach().numpy().T * WEIGHT_SCALE), -127, 127
-    ).astype(np.int8)
+    ).astype(np.int8))
     b2 = np.round(model.hidden.bias.detach().numpy() * OUTPUT_SCALE).astype(np.int32)
 
     w3 = np.clip(

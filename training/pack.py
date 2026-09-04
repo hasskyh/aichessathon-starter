@@ -10,10 +10,19 @@ WSL VM. Nothing here ever holds more than one position's data in ordinary memory
 the OS pages the memmapped arrays to disk as needed.
 
 idx[i, 0] is the mover's own active features in that position, idx[i, 1] the
-opponent's, both -1 padded to width 32 (the most pieces a board can hold). Lichess's
-cp is already relative to the side to move, and nnue.forward concatenates the
-mover's accumulator row first, so storing rows in mover-then-opponent order here
-means train.py never has to know whose turn a position was.
+opponent's, both -1 padded to width 32 (the most pieces a board can hold). nnue.forward
+concatenates the mover's accumulator row first, so storing rows in mover-then-opponent
+order here means train.py never has to know whose turn a position was.
+
+Lichess's cp is White-relative, not side-to-move-relative -- verified directly against
+our own fetched data: corr(cp, white_material - black_material) is positive for BOTH
+white-to-move (+0.73) and black-to-move (+0.68) positions in a 200k-row sample. A truly
+mover-relative cp would flip sign between those two subsets; it does not. The previous
+version of this file assumed the opposite without checking, which meant roughly half
+of every training row (every black-to-move position) paired mover-relative features
+with an opponent-relative target -- the actual root cause of the NNUE's real-game
+weakness diagnosed across this project's whole NNUE effort. process_position() below
+negates cp for black-to-move positions before turning it into a target.
 """
 
 import argparse
@@ -46,7 +55,10 @@ def process_position(fen: str, cp: float, idx: np.memmap, target: np.memmap, i: 
     idx[i, 1, :] = -1
     idx[i, 0, : len(mover)] = mover
     idx[i, 1, : len(opponent)] = opponent
-    target[i] = 1.0 / (1.0 + np.exp(-cp / SIGMOID_SCALE))
+    # cp is White-relative regardless of whose move it is; flip it to mover-relative
+    # here so it lines up with idx's mover-then-opponent row order (see module docstring).
+    mover_cp = cp if board.turn == chess.WHITE else -cp
+    target[i] = 1.0 / (1.0 + np.exp(-mover_cp / SIGMOID_SCALE))
 
 
 def main() -> None:

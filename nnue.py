@@ -20,7 +20,17 @@ OUTPUTS = 32
 
 # acc: int32[2, HIDDEN]   w1: int16[FEATURES, HIDDEN]   b1: int16[HIDDEN]
 # idx: int16[2, n], row 0 white's view and row 1 black's, negatives ignored as padding
-_REFRESH_SIG = "void(int32[:, :], int16[:, :], int16[:], int16[:, :])"
+#
+# Every 2D array here is declared C-contiguous (::1 on the last axis), not just
+# "some strides" (: on both axes). agent.py already forces every one of these into
+# a contiguous layout before it is ever passed in (np.array() copies on load, and
+# slicing STACK's leading axis preserves contiguity of what is left) -- declaring
+# that here, rather than leaving numba to assume nothing about it, is what lets
+# LLVM auto-vectorize the row-wise add below into SIMD instead of walking it with
+# runtime-computed strides. A caller that ever passes a non-contiguous view (e.g.
+# a transpose) now fails loudly with a signature-mismatch TypeError instead of
+# silently compiling a slower specialisation.
+_REFRESH_SIG = "void(int32[:, ::1], int16[:, ::1], int16[::1], int16[:, ::1])"
 
 
 @njit(_REFRESH_SIG, cache=False, fastmath=False)
@@ -41,7 +51,7 @@ def refresh(acc, w1, b1, idx):  # type: ignore[no-untyped-def]
             for h in range(acc.shape[1]):
                 acc[side, h] += w1[feature, h]
 
-_UPDATE_SIG = "void(int32[:,:], int16[:,:], int16[:,:], int16[:,:])"
+_UPDATE_SIG = "void(int32[:, ::1], int16[:, ::1], int16[:, ::1], int16[:, ::1])"
 
 @njit(_UPDATE_SIG, cache=False, fastmath=False)
 def update(acc, w1, off, on):  # type: ignore[no-untyped-def]
@@ -73,7 +83,7 @@ HIDDEN_SHIFT = 6  # >> after the hidden layer, to bring products back near ACT_M
 
 # acc: int32[2, HIDDEN]   stm: 0 white to move, 1 black
 # w2: int8[2 * HIDDEN, n]   b2: int32[n]   w3: int8[n]   b3: int32
-_FORWARD_SIG = "int32(int32[:, :], int64, int8[:, :], int32[:], int8[:], int32)"
+_FORWARD_SIG = "int32(int32[:, ::1], int64, int8[:, ::1], int32[::1], int8[::1], int32)"
 
 
 @njit(_FORWARD_SIG, cache=False, fastmath=False)

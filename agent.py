@@ -56,11 +56,18 @@ _WEIGHTS = np.load(Path(__file__).resolve().parent / "weights" / "nnue.npz")
 # ctrl already are, rather than read directly as globals from inside jitted code.
 # think() and _warm() are plain Python, so they read the globals directly and pass
 # them onward -- the restriction only bites once you are inside nopython mode.
-W1 = np.array(_WEIGHTS["w1"])
-B1 = np.array(_WEIGHTS["b1"])
-W2 = np.array(_WEIGHTS["w2"])
-B2 = np.array(_WEIGHTS["b2"])
-W3 = np.array(_WEIGHTS["w3"])
+# ascontiguousarray, not array(): np.array()'s default order='K' preserves
+# whatever memory layout the .npz happened to store. export.py's w2 is built via
+# a transpose, which produces Fortran-ordered data even after np.array() copies
+# it -- silently correct but with every row access striding across the whole
+# array instead of walking contiguous memory, and unable to auto-vectorize under
+# nnue.py's now-declared-contiguous signatures. ascontiguousarray forces genuine
+# C order regardless of what was on disk.
+W1 = np.ascontiguousarray(_WEIGHTS["w1"])
+B1 = np.ascontiguousarray(_WEIGHTS["b1"])
+W2 = np.ascontiguousarray(_WEIGHTS["w2"])
+B2 = np.ascontiguousarray(_WEIGHTS["b2"])
+W3 = np.ascontiguousarray(_WEIGHTS["w3"])
 B3 = int(_WEIGHTS["b3"])
 
 
