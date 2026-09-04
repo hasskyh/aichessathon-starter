@@ -15,15 +15,15 @@ import numpy as np
 import torch
 
 import nnue
-from nnue import ACT_MAX, FEATURES, HIDDEN, HIDDEN_SHIFT
+from nnue import ACT_MAX, FEATURES, HIDDEN_SHIFT
 from training.train import ACCUMULATOR_NORM, KEPT_ROWS, NNUE, load_arrays, prepare_batch
 
 WEIGHT_SCALE = 2 ** HIDDEN_SHIFT        # 64
 OUTPUT_SCALE = ACT_MAX * WEIGHT_SCALE   # 8128
 
 
-def load_checkpoint(path: Path) -> NNUE:
-    model = NNUE()
+def load_checkpoint(path: Path, hidden: int) -> NNUE:
+    model = NNUE(hidden=hidden)
     model.load_state_dict(torch.load(path, map_location="cpu"))
     return model.eval()
 
@@ -36,7 +36,9 @@ def quantize(model: NNUE) -> dict[str, np.ndarray]:
     w1 = np.clip(
         np.round(embedding[:FEATURES] * ACT_MAX / ACCUMULATOR_NORM), -32768, 32767
     ).astype(np.int16)
-    b1 = np.zeros(HIDDEN, dtype=np.int16)
+    # derived from the model, not nnue.py's HIDDEN constant: this file must export
+    # correctly whatever size was actually trained, matching hidden.
+    b1 = np.zeros(model.transformer.embedding_dim, dtype=np.int16)
 
     w2 = np.clip(
         np.round(model.hidden.weight.detach().numpy().T * WEIGHT_SCALE), -127, 127
@@ -68,8 +70,9 @@ def verify(
         float_pred = model(mover, opponent).numpy()
 
     quant_pred = np.zeros(n_samples)
+    hidden = weights["w1"].shape[1]
     for k, row_id in enumerate(sample_ids):
-        acc = np.zeros((nnue.PERSPECTIVES, HIDDEN), dtype=np.int32)
+        acc = np.zeros((nnue.PERSPECTIVES, hidden), dtype=np.int32)
         nnue.refresh(acc, weights["w1"], weights["b1"], np.array(idx[row_id]))
         total = nnue.forward(acc, 0, weights["w2"], weights["b2"], weights["w3"], weights["b3"])
         quant_pred[k] = 1.0 / (1.0 + np.exp(-total / OUTPUT_SCALE))
@@ -82,12 +85,13 @@ def verify(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Quantise and export the NNUE.")
     parser.add_argument("--checkpoint", type=Path, default=Path("training/ckpt-10.pt"))
+    parser.add_argument("--hidden", type=int, default=256, help="must match the checkpoint")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--out-dir", type=Path, default=Path("weights"))
     parser.add_argument("--verify-samples", type=int, default=500)
     args = parser.parse_args()
 
-    model = load_checkpoint(args.checkpoint)
+    model = load_checkpoint(args.checkpoint, args.hidden)
     weights = quantize(model)
     save_weights(weights, args.out_dir)
 

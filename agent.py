@@ -43,7 +43,7 @@ MAX_DEPTH = 64
 # clock at. Counting down to a checkpoint beats a modulo on every node.
 CHECK_INTERVAL = 2048.0
 
-STACK = np.zeros((MAX_PLY + 1, 2, 256), dtype=np.int32)  # the NNUE accumulator stack
+STACK = np.zeros((MAX_PLY + 1, 2, nnue.HIDDEN), dtype=np.int32)  # the NNUE accumulator stack
 
 _WEIGHTS = np.load(Path(__file__).resolve().parent / "weights" / "nnue.npz")
 # np.load on an .npz can hand back a non-writable, non-C-contiguous view (W2 is

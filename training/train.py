@@ -13,6 +13,9 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
+from nnue import FEATURES, HIDDEN
+
+OUTPUTS = 32
 KEPT_ROWS = 11_085_978  # pack.py preallocated 11,086,606; the last 628 are dead padding
 
 # The clipped-ReLU below expects each accumulator value near [0, 1]. An unclipped
@@ -30,11 +33,11 @@ ACCUMULATOR_NORM = 16.0
 
 
 class NNUE(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, hidden: int = HIDDEN) -> None:
         super().__init__()
-        self.transformer = nn.EmbeddingBag(769, 256, mode="sum", padding_idx=768)
-        self.hidden = nn.Linear(512, 32)
-        self.output = nn.Linear(32, 1)
+        self.transformer = nn.EmbeddingBag(FEATURES + 1, hidden, mode="sum", padding_idx=FEATURES)
+        self.hidden = nn.Linear(2 * hidden, OUTPUTS)
+        self.output = nn.Linear(OUTPUTS, 1)
 
     def forward(self, mover_idx: Tensor, opponent_idx: Tensor) -> Tensor:
         mover_vec = self.transformer(mover_idx)
@@ -113,6 +116,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train the NNUE.")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--rows", type=int, default=KEPT_ROWS)
+    parser.add_argument("--hidden", type=int, default=HIDDEN)
+    parser.add_argument("--tag", type=str, default="", help="checkpoint filename suffix, e.g. 512")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=8192)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -129,7 +134,7 @@ def main() -> None:
     train_ids = ids[n_val:]
     print(f"{len(train_ids):,} train rows, {len(val_ids):,} validation rows")
 
-    model = NNUE()
+    model = NNUE(hidden=arguments.hidden)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=arguments.lr, weight_decay=arguments.weight_decay
     )
@@ -144,7 +149,8 @@ def main() -> None:
         )
         sat = saturation(model, idx, target, val_ids)
         print(f"epoch {epoch}: train {train_loss:.6f}  val {val_loss:.6f}  saturated {sat:.1%}")
-        torch.save(model.state_dict(), checkpoint_dir / f"ckpt-{epoch}.pt")
+        suffix = f"-{arguments.tag}" if arguments.tag else ""
+        torch.save(model.state_dict(), checkpoint_dir / f"ckpt{suffix}-{epoch}.pt")
 
 
 if __name__ == "__main__":
