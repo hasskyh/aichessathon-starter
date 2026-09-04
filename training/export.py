@@ -16,7 +16,7 @@ import torch
 
 import nnue
 from nnue import ACT_MAX, FEATURES, HIDDEN, HIDDEN_SHIFT
-from training.train import KEPT_ROWS, NNUE, load_arrays, prepare_batch
+from training.train import ACCUMULATOR_NORM, KEPT_ROWS, NNUE, load_arrays, prepare_batch
 
 WEIGHT_SCALE = 2 ** HIDDEN_SHIFT        # 64
 OUTPUT_SCALE = ACT_MAX * WEIGHT_SCALE   # 8128
@@ -30,7 +30,12 @@ def load_checkpoint(path: Path) -> NNUE:
 
 def quantize(model: NNUE) -> dict[str, np.ndarray]:
     embedding = model.transformer.weight.detach().numpy()
-    w1 = np.clip(np.round(embedding[:FEATURES] * ACT_MAX), -32768, 32767).astype(np.int16)
+    # training divides the raw sum by ACCUMULATOR_NORM before its clamp (see train.py);
+    # the runtime clamp has no such division, so that factor must be folded into the
+    # scale here or the exported weights are ACCUMULATOR_NORM times too large.
+    w1 = np.clip(
+        np.round(embedding[:FEATURES] * ACT_MAX / ACCUMULATOR_NORM), -32768, 32767
+    ).astype(np.int16)
     b1 = np.zeros(HIDDEN, dtype=np.int16)
 
     w2 = np.clip(
