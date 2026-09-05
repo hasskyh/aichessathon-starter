@@ -150,7 +150,8 @@ def _order_score(sq: np.ndarray, move: int) -> int:
     victim = sq[(move >> 6) & 63]
     if victim < 0:
         return 0
-    return PIECE_VALUE[victim % 6]
+    attacker = sq[move & 63] % 6
+    return PIECE_VALUE[victim % 6] - attacker
 
 
 @njit(inline="always", cache=False)
