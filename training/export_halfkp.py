@@ -65,8 +65,15 @@ def save_weights(weights: dict[str, np.ndarray], out_dir: Path) -> None:
 def verify(
     model: NNUE, weights: dict[str, np.ndarray], idx: np.memmap, target: np.memmap, n_samples: int
 ) -> None:
+    # n_samples is small (hundreds), so a one-time fancy-index straight off the
+    # memmap here is fine -- the problem train_halfkp.py's block reads avoid is
+    # doing this for every batch of an entire 75M-row epoch, not doing it once.
     sample_ids = np.random.choice(len(idx), n_samples, replace=False)
-    mover, opponent, _ = prepare_batch(idx, target, sample_ids)
+    sample_idx_block = np.array(idx[sample_ids])
+    sample_target_block = np.array(target[sample_ids])
+    mover, opponent, _ = prepare_batch(
+        sample_idx_block, sample_target_block, np.arange(n_samples)
+    )
     with torch.no_grad():
         float_pred = model(mover, opponent).numpy()
 

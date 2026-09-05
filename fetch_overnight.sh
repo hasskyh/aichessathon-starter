@@ -17,7 +17,7 @@ URL="https://database.lichess.org/lichess_db_eval.jsonl.zst"
 OUT=data/raw_halfkp.jsonl
 STATE=data/fetch_state.json
 BLOOM=data/fetch_bloom.bin
-LIMIT=2000000000  # effectively unlimited: the real stop is the source running out
+LIMIT=75000000  # cap for this phase; resumable, so raising it later just continues
 # Sizes the Bloom filter ONLY -- must stay realistic, unlike LIMIT above. Setting
 # this as high as LIMIT once sized a 2+ GB bit array up front and nearly took the
 # whole machine down before the fetch had processed a single real segment. The
