@@ -53,7 +53,7 @@ CHECK_INTERVAL = 2048.0
 TT_SIZE = 1 << 22
 TT_MASK = TT_SIZE - 1
 
-TT_KEY   = np.zeros(TT_SIZE, dtype=np.uint64)   # full hash, for collision detection -- must
+TT_KEY   = np.zeros(TT_SIZE, dtype=np.uint64)    # full hash, for collision detection -- must
                                                  # be uint64 like zobrist_hash_bb's return value;
                                                  # int64 would make a hash with its top bit set
                                                  # compare as negative and corrupt TT_MASK indexing
@@ -70,6 +70,19 @@ HASH_MOVE_SCORE = 10_000  # comfortably above PIECE_VALUE's max (900, a queen): 
 # the NNUE accumulator: refreshed once at the root (in think()), then updated at every
 # make_move via zobrist_delta_bb -- never recomputed from scratch mid-search.
 HASH_STACK = np.zeros(MAX_PLY + 1, dtype=np.uint64)
+
+HISTORY = np.zeros((2, 64, 64), dtype=np.int32)   # Butterfly history board [color][from][to]
+HISTORY_CAP = 80 # Capped score so that it's never more than a capture, no matter how bad a capture
+
+# Repetition detection. Bounded at 101: the halfmove clock (st[3]) resets to 0 on every
+# irreversible move (pawn push or capture), and a repetition can never reach back across
+# one of those, so that's the hard ceiling on how far back this ever needs to look. Two
+# entries get appended per get_move() call (the position we were handed, and the position
+# our own chosen move creates -- get_move() only ever observes every OTHER real ply, since
+# it's called once per our own turn), so 101 covers the worst case of 50 calls between one
+# clock reset and the next (halfmove clock 0 -> 100).
+GAME_HISTORY = np.zeros(101, dtype=np.uint64)
+GAME_HISTORY_LEN = 0
 
 STACK = np.zeros((MAX_PLY + 1, 2, nnue.HIDDEN), dtype=np.int32)  # the NNUE accumulator stack
 
@@ -151,10 +164,11 @@ def nnue_evaluate(
 
 
 @njit(inline="always", cache=False)
-def _order_score(sq: np.ndarray, move: int) -> int:
+def _order_score(sq: np.ndarray, move: int, butterfly: np.ndarray) -> int:
     victim = sq[(move >> 6) & 63]
     if victim < 0:
-        return 0
+        us = sq[move & 63] // 6
+        return min(butterfly[us, move & 63, (move >> 6) & 63], HISTORY_CAP)
     attacker = sq[move & 63] % 6
     return PIECE_VALUE[victim % 6] - attacker
 
@@ -263,11 +277,12 @@ def quiescence(
     b2: np.ndarray,
     w3: np.ndarray,
     b3: int,
+    butterfly: np.ndarray
 ) -> int:
     if _tick(ctrl):
         return 0
     if ply >= MAX_PLY - 2:
-        return nnue_evaluate(stack, ply, st, w2, b2, w3, b3)
+        return evaluate(bb, st, 0)
 
     count, checkers = gen_moves_ex(bb, st, buf[ply], 0)
     if count == 0:
@@ -278,7 +293,7 @@ def quiescence(
         best = -INF
         ordered = False
     else:
-        best = nnue_evaluate(stack, ply, st, w2, b2, w3, b3)
+        best = evaluate(bb, st, count)
         if best >= beta or qdepth == 0:
             return best
         if best > alpha:
@@ -287,7 +302,7 @@ def quiescence(
         # produced them, so compact them in place rather than generating a second time.
         count = _keep_captures(sq, buf[ply], count)
         for i in range(count):
-            scores[ply, i] = _order_score(sq, buf[ply, i])
+            scores[ply, i] = _order_score(sq, buf[ply, i], butterfly)
         ordered = True
 
     for i in range(count):
@@ -300,7 +315,7 @@ def quiescence(
         nnue.update(stack[ply + 1], w1, off, on)
         score = -quiescence(
             bb, sq, st, -beta, -alpha, qdepth - 1, ply + 1, buf, scores, hist, ctrl,
-            stack, w1, w2, b2, w3, b3,
+            stack, w1, w2, b2, w3, b3, butterfly
         )
         unmake_move(bb, sq, st, move, hist, ply)
         if ctrl[2] != 0.0:
@@ -339,6 +354,9 @@ def negamax(
     tt_score: np.ndarray,
     tt_depth: np.ndarray,
     tt_type: np.ndarray,
+    butterfly: np.ndarray,
+    game_history: np.ndarray,
+    game_history_len: int,
 ) -> tuple[int, int]:
     # Every return path below returns (score, best_move) -- the caller negates just
     # the score (score = -child_score), never the pair, since a move one ply down
@@ -353,10 +371,24 @@ def negamax(
         # since this ply never generated or looped over any candidates itself.
         return quiescence(
             bb, sq, st, alpha, beta, QUIESCE_DEPTH, ply, buf, scores, hist, ctrl,
-            stack, w1, w2, b2, w3, b3,
+            stack, w1, w2, b2, w3, b3, butterfly
         ), -1
 
     key = hash_stack[ply]
+
+    # A repeat of an earlier real-game position, or of a position already visited
+    # earlier in THIS search path, is a draw -- checked before the TT, since it's an
+    # unconditional fact about the position, not a heuristic bound. Flagged the first
+    # time it's seen (not only on a strict third occurrence): if a repeat is reachable
+    # at all, the side that wants it can force it, so treating it as available the
+    # moment the search notices it is the standard, conservative choice.
+    for i in range(game_history_len):
+        if game_history[i] == key:
+            return 0, -1
+    for p in range(ply):
+        if hash_stack[p] == key:
+            return 0, -1
+
     alpha_orig = alpha
     found, found_score, hash_move = tt_probe(
         tt_key, tt_move, tt_score, tt_depth, tt_type, key, depth, alpha, beta
@@ -374,9 +406,10 @@ def negamax(
         make_null_move(st, hist, ply)
         stack[ply + 1] = stack[ply]
         hash_stack[ply + 1] = hash_stack[ply] ^ hash_delta
-        child_score, _ = negamax(bb, sq, st, -beta, -beta + 1, depth - 1 - R, ply + 1, 
-                                 buf, scores, hist, ctrl, stack, w1, w2, b2, w3, b3, 
-                                 hash_stack, tt_key, tt_move, tt_score, tt_depth, tt_type
+        child_score, _ = negamax(bb, sq, st, -beta, -beta + 1, depth - 1 - R, ply + 1,
+                                 buf, scores, hist, ctrl, stack, w1, w2, b2, w3, b3,
+                                 hash_stack, tt_key, tt_move, tt_score, tt_depth, tt_type,
+                                 butterfly, game_history, game_history_len
                             )
         score = - child_score
         unmake_null_move(st, hist, ply)
@@ -385,7 +418,7 @@ def negamax(
         if score >= beta:
             return score, -1
     for i in range(count):
-        scores[ply, i] = _order_score(sq, buf[ply, i])
+        scores[ply, i] = _order_score(sq, buf[ply, i], butterfly)
     if hash_move != -1:
         for i in range(count):
             if buf[ply, i] == hash_move:
@@ -406,7 +439,7 @@ def negamax(
         child_score, _ = negamax(
             bb, sq, st, -beta, -alpha, depth - 1, ply + 1, buf, scores, hist, ctrl,
             stack, w1, w2, b2, w3, b3, hash_stack,
-            tt_key, tt_move, tt_score, tt_depth, tt_type,
+            tt_key, tt_move, tt_score, tt_depth, tt_type, butterfly, game_history, game_history_len
         )
         score = -child_score
         unmake_move(bb, sq, st, move, hist, ply)
@@ -423,6 +456,9 @@ def negamax(
         if score >= beta:
             # This move caused the cutoff, so it -- not whatever the loop was on
             # before -- is the refutation worth remembering here.
+            if sq[(move >> 6) & 63] < 0: # Meaning this is not a capture
+                us = sq[move & 63] // 6  # Mover's colour
+                butterfly[us, move & 63, (move >> 6) & 63] += depth * depth
             tt_store(
                 tt_key, tt_move, tt_score, tt_depth, tt_type,
                 key, depth, score, move, alpha_orig, beta,
@@ -448,6 +484,8 @@ def think(
     max_depth: int,
     hash_stack: np.ndarray,
     margin: int,
+    game_history: np.ndarray,
+    game_history_len: int,
 ) -> tuple[int, int, int]:
     """Iterative deepening. Returns the chosen move, the depth it survived, its score.
 
@@ -487,6 +525,7 @@ def think(
                     bb, sq, st, -beta, -alpha, depth - 1, 1, buf, scores, hist, ctrl,
                     stack, W1, W2, B2, W3, B3, hash_stack,
                     TT_KEY, TT_MOVE, TT_SCORE, TT_DEPTH, TT_TYPE,
+                    HISTORY, game_history, game_history_len,
                 )
                 score = -child_score
                 unmake_move(bb, sq, st, move, hist, 0)
@@ -534,19 +573,36 @@ last_nodes = 0.0
 
 
 def get_move(fen: str, time_left_ms: int) -> str:
-    global last_depth, last_nodes
+    global last_depth, last_nodes, GAME_HISTORY_LEN
     bb, sq, st = bitgen.from_fen(fen)
+    current_hash = zobrist_hash_bb(sq, st)
+
+    # st[3] == 0 means the last move played (ours or theirs) was irreversible, so no
+    # earlier position can possibly recur -- everything before this point is moot.
+    if st[3] == 0:
+        GAME_HISTORY[:] = 0
+        GAME_HISTORY_LEN = 0
+    GAME_HISTORY[GAME_HISTORY_LEN] = current_hash
+    GAME_HISTORY_LEN += 1
+
     CTRL[0] = time.monotonic() + max(time_left_ms / 25_000.0, 0.01)
     CTRL[1] = 0.0
     CTRL[2] = 0.0
     CTRL[3] = CHECK_INTERVAL
     move, depth, _score = think(bb, sq, st, BUF, SCORES, HIST, CTRL, STACK, MAX_DEPTH, HASH_STACK,
-                                ASPIRATION_MARGIN
+                                ASPIRATION_MARGIN, GAME_HISTORY, GAME_HISTORY_LEN
                             )
     last_depth = depth
     last_nodes = CTRL[1]
     if move < 0:
         return "0000"  # unreachable: the platform never asks for a move once mated
+
+    # Also record the position OUR move creates -- get_move() is only ever called at
+    # our own turns, so this is the one real ply the search itself never hands back.
+    hash_delta = zobrist_delta_bb(sq, st, move)
+    GAME_HISTORY[GAME_HISTORY_LEN] = current_hash ^ hash_delta
+    GAME_HISTORY_LEN += 1
+
     return bitgen.to_uci(move)
 
 
@@ -577,7 +633,7 @@ def _warm() -> None:
     HASH_STACK[1] = HASH_STACK[0] ^ hash_delta
     negamax(
         bb, sq, st, -INF, INF, 1, 1, BUF, SCORES, HIST, CTRL, STACK, W1, W2, B2, W3, B3, HASH_STACK,
-        TT_KEY, TT_MOVE, TT_SCORE, TT_DEPTH, TT_TYPE,
+        TT_KEY, TT_MOVE, TT_SCORE, TT_DEPTH, TT_TYPE, HISTORY, GAME_HISTORY, GAME_HISTORY_LEN
     )
     unmake_move(bb, sq, st, move, HIST, 0)
 

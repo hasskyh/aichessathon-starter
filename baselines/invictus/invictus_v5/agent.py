@@ -510,6 +510,7 @@ def think(
     hash_stack[0] = zobrist_hash_bb(sq, st)
     for depth in range(1, max_depth + 1):
         alpha, beta = (-INF, INF) if depth == 1 else (value - margin, value + margin)
+        aborted = False
         while True: 
             best_move = -1
             best_score = -INF
@@ -529,12 +530,13 @@ def think(
                 score = -child_score
                 unmake_move(bb, sq, st, move, hist, 0)
                 if ctrl[2] != 0.0:
+                    aborted = True
                     break
                 if score > best_score:
                     best_score = score
                     best_move = move
-            if ctrl[2] != 0.0:
-                break  # an unfinished depth is discarded, as in the original
+            if aborted:
+                break
             if best_score <= alpha and alpha > -INF:
                 alpha = -INF
                 continue
@@ -542,11 +544,20 @@ def think(
                 beta = INF
                 continue
             break
+        # An aborted scan is still salvageable if what it found so far already cleared
+        # the window -- that's a genuine validated score, not a fail-low bound, so a
+        # well-ordered partial result really can beat the previous depth here. But if
+        # best_score never cleared alpha, every score examined is an unresolved bound
+        # (the same condition that would have triggered a widen-and-retry had there
+        # been time), and comparing bounds against each other is meaningless -- discard
+        # the whole depth in that case, same as the fully-aborted case always did.
+        if aborted and best_score <= alpha:
+            break
         if best_move != -1:
             pv = best_move
             reached = depth
             value = best_score
-        if time.monotonic() > ctrl[0]:
+        if aborted or time.monotonic() > ctrl[0]:
             break
     return pv, reached, value
 
