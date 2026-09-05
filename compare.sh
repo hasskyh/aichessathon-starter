@@ -7,6 +7,11 @@
 #
 # Defaults: 40 games at 120s+0.1s, one game per core. Both agent.py files are
 # syntax checked first, because a typo costs a second here and a whole match later.
+#
+# Openings are drawn from openings/suite.pgn (override with OPENINGS=path), 16 plies
+# deep, in random order; -repeat plays each chosen opening twice with colors swapped,
+# so a result reflects engine strength rather than which side got the better of one
+# fixed, deterministically-replayed line.
 set -euo pipefail
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -22,6 +27,7 @@ b=${2%/}
 games=${3:-40}
 tc=${4:-120+0.1}
 concurrency=${CONCURRENCY:-$(nproc)}
+openings=${OPENINGS:-$root/openings/suite.pgn}
 
 cli=$(command -v cutechess-cli 2>/dev/null || true)
 if [ -z "$cli" ]; then
@@ -60,6 +66,8 @@ echo
     -engine name="$na" cmd=./engine.sh arg="$a" proto=uci \
     -engine name="$nb" cmd=./engine.sh arg="$b" proto=uci \
     -each dir="$root" tc="$tc" \
+    -openings file="$openings" format=pgn order=random plies=16 \
+    -repeat \
     -games "$games" -concurrency "$concurrency" -recover \
     -pgnout "$pgn"
 echo

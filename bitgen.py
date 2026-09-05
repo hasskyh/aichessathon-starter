@@ -885,6 +885,10 @@ _PROMO_CHAR = {KNIGHT: "n", BISHOP: "b", ROOK: "r", QUEEN: "q"}
 
 STARTING_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 
+@njit(inline="always", cache=False)
+def has_non_pawn_material(bb: np.ndarray, us: np.int32) -> bool:
+    return (bb[us*6+KNIGHT] or bb[us*6+BISHOP] or bb[us*6+ROOK] or bb[us*6+QUEEN]) != 0
+
 
 def new_buffers():
     """The scratch a search needs: one move list and one undo record per ply."""

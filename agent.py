@@ -27,8 +27,11 @@ from bitgen import (
     make_move,
     popcount,
     unmake_move,
+    has_non_pawn_material,
 )
 from zobrist import (
+    ZOBRIST_EP,
+    ZOBRIST_SIDE,
     zobrist_delta_bb,
     zobrist_hash_bb,
 )
@@ -39,6 +42,8 @@ MATE = 1_000_000
 INF = 1 << 30
 QUIESCE_DEPTH = 6
 MAX_DEPTH = 64
+R = 2 # How deep to null move prune
+ASPIRATION_MARGIN = 50
 
 # ctrl[0] deadline, ctrl[1] nodes, ctrl[2] abort flag, ctrl[3] next node to check the
 # clock at. Counting down to a checkpoint beats a modulo on every node.
@@ -221,6 +226,24 @@ def tt_store(
     tt_depth[idx] = depth
     tt_type[idx] = node_type
 
+@njit(inline="always", cache=False)
+def make_null_move(st: np.ndarray, hist: np.ndarray, ply: int) -> None:
+    hist[ply, 2] = st[2]    # Saves en passant rights
+    hist[ply, 3] = st[3]    # Saves halfmove clock
+    us = st[0]
+    st[2] = -1              # No en passant after being passed a turn
+    st[3] += 1              # Halfmove count obviously goes up
+    st[0] = 1 - us          # Flip side to move
+    st[4] += us
+
+@njit(inline="always", cache=False)
+def unmake_null_move(st: np.ndarray, hist: np.ndarray, ply: int) -> None:
+    us = 1 - st[0]
+    st[0] = us
+    st[2] = hist[ply, 2]
+    st[3] = hist[ply, 3]
+    st[4] -= us
+
 @njit(cache=False)
 def quiescence(
     bb: np.ndarray,
@@ -344,6 +367,23 @@ def negamax(
     count, checkers = gen_moves_ex(bb, st, buf[ply], 0)
     if count == 0:
         return (-MATE if checkers else 0), -1
+    if not checkers and depth >= 3 and has_non_pawn_material(bb, st[0]):
+        hash_delta = ZOBRIST_SIDE
+        if st[2] >= 0:
+            hash_delta ^= ZOBRIST_EP[st[2] & 7]
+        make_null_move(st, hist, ply)
+        stack[ply + 1] = stack[ply]
+        hash_stack[ply + 1] = hash_stack[ply] ^ hash_delta
+        child_score, _ = negamax(bb, sq, st, -beta, -beta + 1, depth - 1 - R, ply + 1, 
+                                 buf, scores, hist, ctrl, stack, w1, w2, b2, w3, b3, 
+                                 hash_stack, tt_key, tt_move, tt_score, tt_depth, tt_type
+                            )
+        score = - child_score
+        unmake_null_move(st, hist, ply)
+        if ctrl[2] != 0.0:
+            return 0, -1
+        if score >= beta:
+            return score, -1
     for i in range(count):
         scores[ply, i] = _order_score(sq, buf[ply, i])
     if hash_move != -1:
@@ -407,6 +447,7 @@ def think(
     stack: np.ndarray,
     max_depth: int,
     hash_stack: np.ndarray,
+    margin: int,
 ) -> tuple[int, int, int]:
     """Iterative deepening. Returns the chosen move, the depth it survived, its score.
 
@@ -426,32 +467,42 @@ def think(
     pv = moves[0]
     reached = 0
     value = 0
+
     nnue.refresh(stack[0], W1, B1, features.active_bb(sq))
     hash_stack[0] = zobrist_hash_bb(sq, st)
     for depth in range(1, max_depth + 1):
-        best_move = -1
-        best_score = -INF
-        for move in [pv] + [m for m in moves if m != pv]:
-            off, on = features.deltas_bb(sq, st, move)
-            hash_delta = zobrist_delta_bb(sq, st, move)
-            make_move(bb, sq, st, move, hist, 0)
-            stack[1] = stack[0]
-            nnue.update(stack[1], W1, off, on)
-            hash_stack[1] = hash_stack[0] ^ hash_delta
-            child_score, _ = negamax(
-                bb, sq, st, -INF, INF, depth - 1, 1, buf, scores, hist, ctrl,
-                stack, W1, W2, B2, W3, B3, hash_stack,
-                TT_KEY, TT_MOVE, TT_SCORE, TT_DEPTH, TT_TYPE,
-            )
-            score = -child_score
-            unmake_move(bb, sq, st, move, hist, 0)
+        alpha, beta = (-INF, INF) if depth == 1 else (value - margin, value + margin)
+        while True: 
+            best_move = -1
+            best_score = -INF
+            for move in [pv] + [m for m in moves if m != pv]:
+                off, on = features.deltas_bb(sq, st, move)
+                hash_delta = zobrist_delta_bb(sq, st, move)
+                make_move(bb, sq, st, move, hist, 0)
+                stack[1] = stack[0]
+                nnue.update(stack[1], W1, off, on)
+                hash_stack[1] = hash_stack[0] ^ hash_delta
+                child_score, _ = negamax(
+                    bb, sq, st, -beta, -alpha, depth - 1, 1, buf, scores, hist, ctrl,
+                    stack, W1, W2, B2, W3, B3, hash_stack,
+                    TT_KEY, TT_MOVE, TT_SCORE, TT_DEPTH, TT_TYPE,
+                )
+                score = -child_score
+                unmake_move(bb, sq, st, move, hist, 0)
+                if ctrl[2] != 0.0:
+                    break
+                if score > best_score:
+                    best_score = score
+                    best_move = move
             if ctrl[2] != 0.0:
-                break
-            if score > best_score:
-                best_score = score
-                best_move = move
-        if ctrl[2] != 0.0:
-            break  # an unfinished depth is discarded, as in the original
+                break  # an unfinished depth is discarded, as in the original
+            if best_score <= alpha and alpha > -INF:
+                alpha = -INF
+                continue
+            if best_score >= beta and beta < INF:
+                beta = INF
+                continue
+            break
         if best_move != -1:
             pv = best_move
             reached = depth
@@ -478,7 +529,9 @@ def get_move(fen: str, time_left_ms: int) -> str:
     CTRL[1] = 0.0
     CTRL[2] = 0.0
     CTRL[3] = CHECK_INTERVAL
-    move, depth, _score = think(bb, sq, st, BUF, SCORES, HIST, CTRL, STACK, MAX_DEPTH, HASH_STACK)
+    move, depth, _score = think(bb, sq, st, BUF, SCORES, HIST, CTRL, STACK, MAX_DEPTH, HASH_STACK,
+                                ASPIRATION_MARGIN
+                            )
     last_depth = depth
     last_nodes = CTRL[1]
     if move < 0:
