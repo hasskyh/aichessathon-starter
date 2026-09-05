@@ -356,6 +356,7 @@ def negamax(
     tt_type: np.ndarray,
     butterfly: np.ndarray,
     game_history: np.ndarray,
+    game_history_len: int,
 ) -> tuple[int, int]:
     # Every return path below returns (score, best_move) -- the caller negates just
     # the score (score = -child_score), never the pair, since a move one ply down
@@ -381,7 +382,7 @@ def negamax(
     # time it's seen (not only on a strict third occurrence): if a repeat is reachable
     # at all, the side that wants it can force it, so treating it as available the
     # moment the search notices it is the standard, conservative choice.
-    for i in range(game_history.shape[0]):
+    for i in range(game_history_len):
         if game_history[i] == key:
             return 0, -1
     for p in range(ply):
@@ -408,7 +409,7 @@ def negamax(
         child_score, _ = negamax(bb, sq, st, -beta, -beta + 1, depth - 1 - R, ply + 1,
                                  buf, scores, hist, ctrl, stack, w1, w2, b2, w3, b3,
                                  hash_stack, tt_key, tt_move, tt_score, tt_depth, tt_type,
-                                 butterfly, game_history
+                                 butterfly, game_history, game_history_len
                             )
         score = - child_score
         unmake_null_move(st, hist, ply)
@@ -438,7 +439,7 @@ def negamax(
         child_score, _ = negamax(
             bb, sq, st, -beta, -alpha, depth - 1, ply + 1, buf, scores, hist, ctrl,
             stack, w1, w2, b2, w3, b3, hash_stack,
-            tt_key, tt_move, tt_score, tt_depth, tt_type, butterfly, game_history
+            tt_key, tt_move, tt_score, tt_depth, tt_type, butterfly, game_history, game_history_len
         )
         score = -child_score
         unmake_move(bb, sq, st, move, hist, ply)
@@ -484,6 +485,7 @@ def think(
     hash_stack: np.ndarray,
     margin: int,
     game_history: np.ndarray,
+    game_history_len: int,
 ) -> tuple[int, int, int]:
     """Iterative deepening. Returns the chosen move, the depth it survived, its score.
 
@@ -522,7 +524,7 @@ def think(
                     bb, sq, st, -beta, -alpha, depth - 1, 1, buf, scores, hist, ctrl,
                     stack, W1, W2, B2, W3, B3, hash_stack,
                     TT_KEY, TT_MOVE, TT_SCORE, TT_DEPTH, TT_TYPE,
-                    HISTORY, game_history,
+                    HISTORY, game_history, game_history_len,
                 )
                 score = -child_score
                 unmake_move(bb, sq, st, move, hist, 0)
@@ -577,7 +579,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
     CTRL[2] = 0.0
     CTRL[3] = CHECK_INTERVAL
     move, depth, _score = think(bb, sq, st, BUF, SCORES, HIST, CTRL, STACK, MAX_DEPTH, HASH_STACK,
-                                ASPIRATION_MARGIN, GAME_HISTORY
+                                ASPIRATION_MARGIN, GAME_HISTORY, GAME_HISTORY_LEN
                             )
     last_depth = depth
     last_nodes = CTRL[1]
@@ -620,7 +622,7 @@ def _warm() -> None:
     HASH_STACK[1] = HASH_STACK[0] ^ hash_delta
     negamax(
         bb, sq, st, -INF, INF, 1, 1, BUF, SCORES, HIST, CTRL, STACK, W1, W2, B2, W3, B3, HASH_STACK,
-        TT_KEY, TT_MOVE, TT_SCORE, TT_DEPTH, TT_TYPE, HISTORY, GAME_HISTORY
+        TT_KEY, TT_MOVE, TT_SCORE, TT_DEPTH, TT_TYPE, HISTORY, GAME_HISTORY, GAME_HISTORY_LEN
     )
     unmake_move(bb, sq, st, move, HIST, 0)
 
