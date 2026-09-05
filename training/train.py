@@ -33,7 +33,7 @@ ACCUMULATOR_NORM = 16.0
 
 
 class NNUE(nn.Module):
-    def __init__(self, hidden: int = HIDDEN) -> None:
+    def __init__(self, hidden: int = HIDDEN, outputs: int = OUTPUTS) -> None:
         super().__init__()
         self.transformer = nn.EmbeddingBag(FEATURES + 1, hidden, mode="sum", padding_idx=FEATURES)
         # EmbeddingBag has no bias of its own; nnue.py's refresh() initialises the
@@ -43,8 +43,11 @@ class NNUE(nn.Module):
         # in the same units as the embedding weights and export.py can scale it the
         # same way (round(bias1 * ACT_MAX / ACCUMULATOR_NORM), matching w1).
         self.bias1 = nn.Parameter(torch.zeros(hidden))
-        self.hidden = nn.Linear(2 * hidden, OUTPUTS)
-        self.output = nn.Linear(OUTPUTS, 1)
+        # outputs == 0 drops the second hidden layer entirely: the accumulator's own
+        # clipped-ReLU is the only nonlinearity left, and output reads straight off
+        # the 2*hidden concat (a cheaper eval to test against the normal architecture).
+        self.hidden = nn.Linear(2 * hidden, outputs) if outputs > 0 else None
+        self.output = nn.Linear(outputs if outputs > 0 else 2 * hidden, 1)
 
     def forward(self, mover_idx: Tensor, opponent_idx: Tensor) -> Tensor:
         mover_vec = self.transformer(mover_idx) + self.bias1
@@ -52,7 +55,8 @@ class NNUE(nn.Module):
 
         x = torch.cat([mover_vec, opponent_vec], dim=1) / ACCUMULATOR_NORM
         x = torch.clamp(x, 0.0, 1.0)
-        x = torch.clamp(self.hidden(x), 0.0, 1.0)
+        if self.hidden is not None:
+            x = torch.clamp(self.hidden(x), 0.0, 1.0)
 
         return torch.sigmoid(self.output(x)).squeeze(1)
 
@@ -125,6 +129,9 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--rows", type=int, default=KEPT_ROWS)
     parser.add_argument("--hidden", type=int, default=HIDDEN)
+    parser.add_argument(
+        "--outputs", type=int, default=OUTPUTS, help="second hidden layer width, 0 to drop it"
+    )
     parser.add_argument("--tag", type=str, default="", help="checkpoint filename suffix, e.g. 512")
     parser.add_argument(
         "--resume", type=Path, default=None, help="checkpoint to continue training from"
@@ -148,7 +155,7 @@ def main() -> None:
     train_ids = ids[n_val:]
     print(f"{len(train_ids):,} train rows, {len(val_ids):,} validation rows")
 
-    model = NNUE(hidden=arguments.hidden)
+    model = NNUE(hidden=arguments.hidden, outputs=arguments.outputs)
     if arguments.resume is not None:
         model.load_state_dict(torch.load(arguments.resume, map_location="cpu"))
         print(f"resumed from {arguments.resume}")
