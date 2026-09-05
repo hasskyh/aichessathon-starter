@@ -8,6 +8,25 @@
 # The algorithm is a faithful port, deliberately: same evaluation, same alpha-beta,
 # same quiescence depth, same move ordering including its quirks, so the strength
 # difference against invictus_quiesce is speed and nothing else.
+#
+# v6 adds a second, phase-specific NNUE: a net trained only on positions under
+# ENDGAME_PIECE_LIMIT pieces (training/train.py --outputs, ckpt-endgame-*.pt), used
+# for the whole search whenever the CURRENT position (checked once per get_move()
+# call, in think(), before any move is made) is already that far into the endgame.
+# negamax/quiescence themselves are untouched from invictus_v5 -- they already take
+# whichever w1/w2/b2/w3/b3 arrays think() hands them, and the endgame net shares the
+# main net's exact architecture/dtypes, so passing W1E..B3E through instead of
+# W1..B3 needs no new numba specialisation at all.
+#
+# This was originally a per-node switch inside negamax/quiescence themselves (piece
+# count is monotonic non-increasing down any line, so a switch mid-tree never has to
+# switch back), tried two ways: one branchy pair of functions carrying both weight
+# sets, and two separate compiled functions per regime. Both compiled fine but blew
+# the platform's 60s import budget alone (measured 79s and 90s respectively on one
+# core; invictus_v5's own unmodified pair was already at ~54s) -- the cost scales with
+# how much code negamax/quiescence's compiled bodies contain, not just how much of it
+# runs. Deciding once per move, before entering the jitted tree at all, avoids adding
+# anything to that budget, at the cost of not switching mid-tree within one search.
 
 import time
 from pathlib import Path
@@ -111,6 +130,18 @@ B2 = np.ascontiguousarray(_WEIGHTS["b2"])
 W3 = np.ascontiguousarray(_WEIGHTS["w3"])
 B3 = int(_WEIGHTS["b3"])
 
+# Same architecture, same quantisation, trained only on positions under
+# ENDGAME_PIECE_LIMIT pieces -- shares W1..B3's shapes and dtypes exactly, so
+# think() can pass either set into the same compiled negamax/quiescence.
+_WEIGHTS_ENDGAME = np.load(Path(__file__).resolve().parent / "weights" / "endgame" / "nnue.npz")
+W1E = np.ascontiguousarray(_WEIGHTS_ENDGAME["w1"])
+B1E = np.ascontiguousarray(_WEIGHTS_ENDGAME["b1"])
+W2E = np.ascontiguousarray(_WEIGHTS_ENDGAME["w2"])
+B2E = np.ascontiguousarray(_WEIGHTS_ENDGAME["b2"])
+W3E = np.ascontiguousarray(_WEIGHTS_ENDGAME["w3"])
+B3E = int(_WEIGHTS_ENDGAME["b3"])
+ENDGAME_PIECE_LIMIT = 8  # total pieces, both sides, kings included
+
 @njit(cache=False)
 def _now() -> float:
     """Wall clock inside nopython mode. objmode costs ~700ns, so call it rarely."""
@@ -127,6 +158,17 @@ def _tick(ctrl: np.ndarray) -> bool:
         if _now() > ctrl[0]:
             ctrl[2] = 1.0
     return ctrl[2] != 0.0
+
+
+@njit(inline="always", cache=False)
+def total_pieces(bb: np.ndarray) -> int:
+    """Both sides, kings included -- matches how the endgame net's training data was
+    filtered (piece count straight off the FEN board field), so the same threshold
+    means the same thing on both sides of training and inference."""
+    count = 0
+    for i in range(bb.shape[0]):
+        count += popcount(bb[i])
+    return count
 
 
 @njit(inline="always", cache=False)
@@ -506,7 +548,14 @@ def think(
     reached = 0
     value = 0
 
-    nnue.refresh(stack[0], W1, B1, features.active_bb(sq))
+    # Decided once per move, before entering the jitted tree: which net covers the
+    # whole search for this move. See the module docstring for why this isn't a
+    # per-node switch mid-tree -- that blew the import budget when tried.
+    use_endgame = total_pieces(bb) < ENDGAME_PIECE_LIMIT
+    if use_endgame:
+        nnue.refresh(stack[0], W1E, B1E, features.active_bb(sq))
+    else:
+        nnue.refresh(stack[0], W1, B1, features.active_bb(sq))
     hash_stack[0] = zobrist_hash_bb(sq, st)
     for depth in range(1, max_depth + 1):
         alpha, beta = (-INF, INF) if depth == 1 else (value - margin, value + margin)
@@ -519,14 +568,24 @@ def think(
                 hash_delta = zobrist_delta_bb(sq, st, move)
                 make_move(bb, sq, st, move, hist, 0)
                 stack[1] = stack[0]
-                nnue.update(stack[1], W1, off, on)
-                hash_stack[1] = hash_stack[0] ^ hash_delta
-                child_score, _ = negamax(
-                    bb, sq, st, -beta, -alpha, depth - 1, 1, buf, scores, hist, ctrl,
-                    stack, W1, W2, B2, W3, B3, hash_stack,
-                    TT_KEY, TT_MOVE, TT_SCORE, TT_DEPTH, TT_TYPE,
-                    HISTORY, game_history, game_history_len,
-                )
+                if use_endgame:
+                    nnue.update(stack[1], W1E, off, on)
+                    hash_stack[1] = hash_stack[0] ^ hash_delta
+                    child_score, _ = negamax(
+                        bb, sq, st, -beta, -alpha, depth - 1, 1, buf, scores, hist, ctrl,
+                        stack, W1E, W2E, B2E, W3E, B3E, hash_stack,
+                        TT_KEY, TT_MOVE, TT_SCORE, TT_DEPTH, TT_TYPE,
+                        HISTORY, game_history, game_history_len,
+                    )
+                else:
+                    nnue.update(stack[1], W1, off, on)
+                    hash_stack[1] = hash_stack[0] ^ hash_delta
+                    child_score, _ = negamax(
+                        bb, sq, st, -beta, -alpha, depth - 1, 1, buf, scores, hist, ctrl,
+                        stack, W1, W2, B2, W3, B3, hash_stack,
+                        TT_KEY, TT_MOVE, TT_SCORE, TT_DEPTH, TT_TYPE,
+                        HISTORY, game_history, game_history_len,
+                    )
                 score = -child_score
                 unmake_move(bb, sq, st, move, hist, 0)
                 if ctrl[2] != 0.0:
