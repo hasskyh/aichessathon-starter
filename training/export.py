@@ -22,11 +22,11 @@ WEIGHT_SCALE = 2 ** HIDDEN_SHIFT        # 64
 OUTPUT_SCALE = ACT_MAX * WEIGHT_SCALE   # 8128
 
 
-def load_checkpoint(path: Path, hidden: int) -> NNUE:
-    model = NNUE(hidden=hidden)
-    # strict=False: checkpoints trained before bias1 existed have no such key.
-    # Reported explicitly rather than silently accepted -- a real, unexpected
-    # mismatch here should be just as loud as it would be with strict=True.
+def load_checkpoint(path: Path, hidden: int, outputs: int) -> NNUE:
+    model = NNUE(hidden=hidden, outputs=outputs)
+    # strict=False: checkpoints trained before bias1 existed have no such key, and a
+    # flat (outputs=0) checkpoint has no hidden.weight/hidden.bias at all -- both are
+    # expected missing-key cases, not errors, but still reported for visibility.
     result = model.load_state_dict(torch.load(path, map_location="cpu"), strict=False)
     if result.missing_keys or result.unexpected_keys:
         print(f"  load_state_dict: missing={result.missing_keys} "
@@ -48,6 +48,19 @@ def quantize(model: NNUE) -> dict[str, np.ndarray]:
     b1 = np.clip(
         np.round(model.bias1.detach().numpy() * ACT_MAX / ACCUMULATOR_NORM), -32768, 32767
     ).astype(np.int16)
+
+    if model.hidden is None:
+        # Flat architecture (train.py --outputs 0): no hidden layer at all, so
+        # model.output is a single Linear(2*hidden, 1) applied directly to the
+        # clamped accumulator. That clamped accumulator is exactly the same
+        # ACT_MAX-scaled quantity the normal architecture's *second* stage (w3, b3)
+        # consumes, so this reuses that stage's scale factors unchanged -- nnue.py's
+        # forward_flat() is the runtime side of this same equivalence.
+        w3 = np.clip(
+            np.round(model.output.weight.detach().numpy().squeeze(0) * WEIGHT_SCALE), -127, 127
+        ).astype(np.int8)
+        b3 = np.int32(round(model.output.bias.item() * OUTPUT_SCALE))
+        return {"w1": w1, "b1": b1, "w3": w3, "b3": b3}
 
     # .T is a view with reversed strides (Fortran order), not a copy -- every
     # downstream op here (round, clip, astype) preserves that layout rather than
@@ -85,10 +98,14 @@ def verify(
 
     quant_pred = np.zeros(n_samples)
     hidden = weights["w1"].shape[1]
+    flat = "w2" not in weights
     for k, row_id in enumerate(sample_ids):
         acc = np.zeros((nnue.PERSPECTIVES, hidden), dtype=np.int32)
         nnue.refresh(acc, weights["w1"], weights["b1"], np.array(idx[row_id]))
-        total = nnue.forward(acc, 0, weights["w2"], weights["b2"], weights["w3"], weights["b3"])
+        if flat:
+            total = nnue.forward_flat(acc, 0, weights["w3"], weights["b3"])
+        else:
+            total = nnue.forward(acc, 0, weights["w2"], weights["b2"], weights["w3"], weights["b3"])
         quant_pred[k] = 1.0 / (1.0 + np.exp(-total / OUTPUT_SCALE))
 
     diff = np.abs(float_pred - quant_pred)
@@ -100,12 +117,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Quantise and export the NNUE.")
     parser.add_argument("--checkpoint", type=Path, default=Path("training/ckpt-10.pt"))
     parser.add_argument("--hidden", type=int, default=256, help="must match the checkpoint")
+    parser.add_argument(
+        "--outputs", type=int, default=32, help="must match the checkpoint; 0 for a flat net"
+    )
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--out-dir", type=Path, default=Path("weights"))
     parser.add_argument("--verify-samples", type=int, default=500)
     args = parser.parse_args()
 
-    model = load_checkpoint(args.checkpoint, args.hidden)
+    model = load_checkpoint(args.checkpoint, args.hidden, args.outputs)
     weights = quantize(model)
     save_weights(weights, args.out_dir)
 
