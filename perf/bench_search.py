@@ -1,88 +1,107 @@
-"""Search throughput: the jitted bitboard search against the python-chess original.
+"""Search depth and throughput: fixed time, head-to-head between any two agent
+baselines via their own think() entry point.
 
-Fixed depth, not fixed time. A time-limited search does however many nodes it can, and
-on a noisy laptop that swings 25% run to run; a fixed depth does exactly the same work
-every time, so the only thing left varying is the clock. Times are best-of-N for the
-same reason.
+Usage: perf/bench_search.py <baseline-dir-A> <baseline-dir-B> [seconds]
 
-Both engines run the same algorithm, so the root score must agree. Node counts will
-not: the two generators emit moves in different orders, so alpha-beta cuts in different
-places. Nodes per second is the honest comparison.
+Fixed time, not fixed depth -- a full-depth benchmark on positions like kiwipete can
+take many minutes per engine once pruning (or the lack of it) swings node counts by
+orders of magnitude, which isn't a fair per-position time budget either. Fixed time
+matches how the engine is actually used (a real clock budget per move) and reports
+back whatever depth and node count that time bought -- reaching a deeper depth in the
+same time, or the same depth on fewer nodes, is exactly what the pruning additions
+(LMR/LMP/RFP/killers) are supposed to deliver.
+
+Each run resets the engine's own transposition table, history, and killer-move globals
+to their fresh-process values first -- otherwise a later position would hit cached TT
+entries left over from an earlier one and look artificially fast. A fresh, empty
+game-history array is passed to think() every call for the same reason (no
+repetition-draw state leaking across positions).
 """
 
-import math
 import os
 import sys
 import time
 
-root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, root)
+import numpy as np
 
-import chess  # noqa: E402
-
-import bitgen  # noqa: E402
-
-sys.path.insert(0, os.path.join(root, "baselines/invictus/invictus_moveGen"))
-import agent as fast  # noqa: E402
-
-sys.path.insert(0, os.path.join(root, "baselines/invictus/invictus_quiesce"))
-del sys.modules["agent"]
-import agent as slow  # noqa: E402
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 POSITIONS = [
-    ("startpos", bitgen.STARTING_FEN),
+    ("startpos", "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"),
     ("kiwipete", "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"),
     ("midgame", "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P3/2NP1N2/PPPQ1PPP/R4RK1 w - - 0 10"),
     ("endgame", "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1"),
 ]
 
-DEPTH = 3
-REPEATS = 3
+
+def load(path: str):
+    sys.path.insert(0, os.path.join(ROOT, path))
+    sys.modules.pop("agent", None)
+    import agent
+    return agent
 
 
-def run_fast(fen, depth):
-    bb, sq, st = bitgen.from_fen(fen)
-    fast.CTRL[0] = time.monotonic() + 1e6  # effectively no deadline
-    fast.CTRL[1] = 0.0
-    fast.CTRL[2] = 0.0
-    fast.CTRL[3] = fast.CHECK_INTERVAL
+def reset_state(mod) -> None:
+    mod.TT_KEY.fill(0)
+    mod.TT_MOVE.fill(-1)
+    mod.TT_SCORE.fill(0)
+    mod.TT_DEPTH.fill(0)
+    mod.TT_TYPE.fill(0)
+    mod.HISTORY.fill(0)
+    if hasattr(mod, "KILLERS"):  # not every baseline has killer moves
+        mod.KILLERS.fill(-1)
+
+
+def run(mod, fen: str, seconds: float) -> tuple[float, int, int, int]:
+    bb, sq, st = mod.bitgen.from_fen(fen)
+    reset_state(mod)
+    game_history = np.zeros(101, dtype=np.uint64)
+    mod.CTRL[0] = time.monotonic() + seconds
+    mod.CTRL[1] = 0.0
+    mod.CTRL[2] = 0.0
+    mod.CTRL[3] = mod.CHECK_INTERVAL
     start = time.perf_counter()
-    score = fast.negamax(
-        bb, sq, st, -fast.INF, fast.INF, depth, 0,
-        fast.BUF, fast.SCORES, fast.HIST, fast.CTRL,
+    _move, reached_depth, score = mod.think(
+        bb, sq, st, mod.BUF, mod.SCORES, mod.HIST, mod.CTRL, mod.STACK, mod.KING_SQ,
+        mod.MAX_DEPTH, mod.HASH_STACK, mod.ASPIRATION_MARGIN, game_history, 0,
     )
-    return time.perf_counter() - start, int(fast.CTRL[1]), int(score)
+    elapsed = time.perf_counter() - start
+    return elapsed, int(mod.CTRL[1]), int(score), reached_depth
 
 
-def run_slow(fen, depth):
-    board = chess.Board(fen)
-    slow._deadline = time.monotonic() + 1e6
-    slow._nodes = 0
-    start = time.perf_counter()
-    score = slow.negamax(-math.inf, math.inf, board, depth)
-    return time.perf_counter() - start, slow._nodes, int(score)
+def main() -> None:
+    if len(sys.argv) < 3:
+        print(f"usage: {sys.argv[0]} <baseline-dir-A> <baseline-dir-B> [seconds]", file=sys.stderr)
+        sys.exit(2)
 
+    seconds = float(sys.argv[3]) if len(sys.argv) > 3 else 30.0
 
-print(f"--- fixed depth {DEPTH}, best of {REPEATS} ---\n")
-print(f"{'position':10s} {'engine':14s} {'nodes':>12s} {'time':>9s} {'nps':>12s} {'score':>9s}")
-ratios = []
-for name, fen in POSITIONS:
-    row = {}
-    for label, runner in (("bitgen+numba", run_fast), ("python-chess", run_slow)):
-        best = None
-        for _ in range(REPEATS):
-            elapsed, nodes, score = runner(fen, DEPTH)
-            if best is None or elapsed < best[0]:
-                best = (elapsed, nodes, score)
-        elapsed, nodes, score = best
-        row[label] = (nodes / elapsed, score)
+    label_a = os.path.basename(sys.argv[1].rstrip("/"))
+    label_b = os.path.basename(sys.argv[2].rstrip("/"))
+    mod_a = load(sys.argv[1])
+    mod_b = load(sys.argv[2])
+
+    print(f"--- fixed time {seconds:.0f}s per position ---\n")
+    print(f"{'position':10s} {'engine':34s} {'depth':>6s} {'nodes':>12s} {'time':>9s} {'nps':>12s} {'score':>9s}")
+    depth_deltas = []
+    for name, fen in POSITIONS:
+        row = {}
+        for label, mod in ((label_a, mod_a), (label_b, mod_b)):
+            elapsed, nodes, score, depth = run(mod, fen, seconds)
+            row[label] = (depth, nodes, nodes / elapsed)
+            print(
+                f"{name:10s} {label:34s} {depth:>6d} {nodes:>12,} {elapsed:>8.3f}s "
+                f"{nodes / elapsed / 1000:>10.1f}k {score:>9,}"
+            )
+        depth_delta = row[label_b][0] - row[label_a][0]
+        depth_deltas.append(depth_delta)
         print(
-            f"{name:10s} {label:14s} {nodes:>12,} {elapsed:>8.3f}s "
-            f"{nodes / elapsed / 1000:>10.1f}k {score:>9,}"
+            f"{'':10s} {'-> ' + label_b + ' vs ' + label_a:34s} "
+            f"depth {depth_delta:+d}   nps {row[label_b][2] / row[label_a][2]:.2f}x\n"
         )
-    ratio = row["bitgen+numba"][0] / row["python-chess"][0]
-    ratios.append(ratio)
-    agree = "same" if row["bitgen+numba"][1] == row["python-chess"][1] else "DIFFERENT"
-    print(f"{'':10s} {'-> speedup':14s} {ratio:>12.1f}x   root score {agree}\n")
 
-print(f"mean search speedup {sum(ratios) / len(ratios):.1f}x")
+    print(f"mean depth gained ({label_b} vs {label_a}): {sum(depth_deltas) / len(depth_deltas):+.1f} ply")
+
+
+if __name__ == "__main__":
+    main()
