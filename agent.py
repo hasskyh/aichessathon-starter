@@ -32,8 +32,8 @@ import numpy as np
 from numba import njit, objmode
 
 import bitgen
-import features_halfkp
-import nnue_halfkp as nnue
+from nnue_halfkp_glue import apply_move_nnue, move_deltas, nnue_evaluate, root_refresh
+from nnue_halfkp_glue import HIDDEN as NNUE_HIDDEN
 from bitgen import (
     FLAG_EP,
     MAX_MOVES,
@@ -44,6 +44,9 @@ from bitgen import (
     make_move,
     popcount,
     unmake_move,
+    attackers_to,
+    bit,
+    lsb,
 )
 from zobrist import (
     ZOBRIST_EP,
@@ -55,6 +58,10 @@ from zobrist import (
 PIECE_VALUE = np.array([100, 320, 330, 500, 900, 0], dtype=np.int64)
 MOBILITY_WEIGHT = 4
 MATE = 1_000_000
+MATE_THRESHOLD = MATE - MAX_PLY # Anything larger than this is mate, but closer mates are better
+FUTILITY_DEPTH_LIMIT = 6
+FUTILITY_MARGIN = 150
+
 INF = 1 << 30
 QUIESCE_DEPTH = 6
 MAX_DEPTH = 64
@@ -108,7 +115,7 @@ KILLER_SCORE = 90
 GAME_HISTORY = np.zeros(101, dtype=np.uint64)
 GAME_HISTORY_LEN = 0
 
-STACK = np.zeros((MAX_PLY + 1, 2, nnue.HIDDEN), dtype=np.int32)  # the NNUE accumulator stack
+STACK = np.zeros((MAX_PLY + 1, 2, NNUE_HIDDEN), dtype=np.int32)  # the NNUE accumulator stack
 
 # Both kings' current squares at each ply, maintained the same way STACK is: copied
 # down from the parent ply at every make_move, then the mover's own entry corrected
@@ -138,8 +145,18 @@ _WEIGHTS = np.load(Path(__file__).resolve().parent / "weights" / "nnue_halfkp.np
 # C order regardless of what was on disk.
 W1 = np.ascontiguousarray(_WEIGHTS["w1"])
 B1 = np.ascontiguousarray(_WEIGHTS["b1"])
-W2 = np.ascontiguousarray(_WEIGHTS["w2"])
-B2 = np.ascontiguousarray(_WEIGHTS["b2"])
+# Some architectures (e.g. the flat/general net's forward_flat) have no hidden
+# layer at all, so their checkpoints simply have no w2/b2 -- fall back to an
+# empty array of the right dtype/ndim so agent.py loads either checkpoint shape
+# without numba ever seeing a different type signature for W2/B2.
+W2 = (
+    np.ascontiguousarray(_WEIGHTS["w2"]) if "w2" in _WEIGHTS
+    else np.zeros((0, 0), dtype=np.int8)
+)
+B2 = (
+    np.ascontiguousarray(_WEIGHTS["b2"]) if "b2" in _WEIGHTS
+    else np.zeros(0, dtype=np.int32)
+)
 W3 = np.ascontiguousarray(_WEIGHTS["w3"])
 B3 = int(_WEIGHTS["b3"])
 
@@ -175,62 +192,6 @@ def evaluate(bb: np.ndarray, st: np.ndarray, mobility: int) -> int:
             popcount(bb[us * 6 + kind]) - popcount(bb[them * 6 + kind])
         )
     return material + MOBILITY_WEIGHT * mobility
-
-
-@njit(inline="always", cache=False)
-def nnue_evaluate(
-    stack: np.ndarray,
-    ply: int,
-    st: np.ndarray,
-    w2: np.ndarray,
-    b2: np.ndarray,
-    w3: np.ndarray,
-    b3: int,
-) -> int:
-    """NNUE score for the position at this ply, from the side to move's perspective.
-
-    stack[ply] must already reflect this exact position: refreshed once at the
-    root, then kept current by the king-move-aware update logic at every make_move
-    since (see the module docstring).
-    """
-    return nnue.forward(stack[ply], st[0], w2, b2, w3, b3)
-
-
-@njit(inline="always", cache=False)
-def _apply_move_nnue(
-    stack: np.ndarray,
-    king_sq: np.ndarray,
-    ply: int,
-    sq: np.ndarray,
-    st_us: int,
-    move: int,
-    w1: np.ndarray,
-    b1: np.ndarray,
-    off: np.ndarray,
-    on: np.ndarray,
-) -> None:
-    """Maintain the accumulator and king-square trackers across one make_move,
-    already applied to bb/sq/st by the caller -- st_us is the mover's colour from
-    BEFORE that flip, sq is the board AFTER it (so bitgen.KING lookups here would
-    see the moved piece, which is why the caller passes off/on and the pre-move
-    king squares rather than this function re-deriving anything from sq itself).
-
-    off/on come from halfkp_deltas_bb, called by the caller BEFORE make_move (its
-    own documented protocol) -- safe to pass here for ANY move, king or not, since
-    a king move's own off/on rows are simply unused on the mover's side below.
-    """
-    stack[ply + 1] = stack[ply]
-    king_sq[ply + 1] = king_sq[ply]
-    moved_piece_is_king = sq[(move >> 6) & 63] % 6 == bitgen.KING
-    if moved_piece_is_king:
-        to_square = (move >> 6) & 63
-        king_sq[ply + 1, st_us] = to_square
-        other = 1 - st_us
-        active = features_halfkp.halfkp_active_bb(sq, king_sq[ply + 1, 0], king_sq[ply + 1, 1])
-        nnue.refresh(stack[ply + 1, st_us:st_us + 1], w1, b1, active[st_us:st_us + 1])
-        nnue.update(stack[ply + 1, other:other + 1], w1, off[other:other + 1], on[other:other + 1])
-    else:
-        nnue.update(stack[ply + 1], w1, off, on)
 
 
 @njit(inline="always", cache=False)
@@ -271,6 +232,48 @@ def _lmr_reduction(depth: int, i: int) -> int:
     return r
 
 @njit(inline="always", cache=False)
+def see(bb: np.ndarray, sq: np.ndarray, move: int) -> int:
+    # This is a static exchange evaluation, basically guessing at what captures will occur
+    # and is used to see if a node has any hope of being better than alpha
+    from_sq = move & 63
+    to_sq = (move >> 6) & 63
+    us = sq[from_sq] // 6
+
+    gain = np.empty(32, dtype=np.int64)
+    if (move >> 15) & 3 == FLAG_EP:
+        gain[0] = PIECE_VALUE[0]
+    else:
+        gain[0] = PIECE_VALUE[sq[to_sq] % 6]
+    last_value = PIECE_VALUE[sq[from_sq] % 6]
+
+    occupied = bb[14] ^ bit(from_sq)
+    side = 1 - us
+    depth = 0
+    while True:
+        attackers = attackers_to(bb, to_sq, occupied, side) & occupied
+        if not attackers:
+            break
+        least_kind = -1
+        least_sq = -1
+        for kind in range(6):
+            candidates = attackers & bb[side * 6 + kind]
+            if candidates:
+                least_kind = kind
+                least_sq = lsb(candidates)
+                break
+        depth += 1
+        gain[depth] = last_value - gain[depth - 1]
+        occupied ^= bit(least_sq)
+        last_value = PIECE_VALUE[least_kind]
+        side = 1 - side
+
+    while depth > 0:
+        gain[depth - 1] = -max(-gain[depth - 1], gain[depth])
+        depth -= 1
+    return gain[0]
+
+
+@njit(inline="always", cache=False)
 def _keep_captures(sq: np.ndarray, moves: np.ndarray, count: int) -> int:
     """Compact the capture moves to the front, preserving their order. Returns how many.
 
@@ -288,7 +291,7 @@ def _keep_captures(sq: np.ndarray, moves: np.ndarray, count: int) -> int:
 @njit(inline="always", cache=False)
 def tt_probe(
     tt_key: np.ndarray, tt_move: np.ndarray, tt_score: np.ndarray, tt_depth: np.ndarray,
-    tt_type: np.ndarray, key: int, depth: int, alpha: int, beta: int,
+    tt_type: np.ndarray, key: int, depth: int, alpha: int, beta: int, ply: int
 ) -> tuple[bool, int, int]:
     idx = key & TT_MASK
     if tt_key[idx] != key:
@@ -297,6 +300,10 @@ def tt_probe(
     if tt_depth[idx] < depth:
         return False, 0, hash_move
     score, node_type = tt_score[idx], tt_type[idx]
+    if score > MATE_THRESHOLD:
+        score -= ply
+    elif score < -MATE_THRESHOLD:
+        score += ply
     if node_type == TT_EXACT:
         return True, score, hash_move
     if node_type == TT_LOWER and score >= beta:
@@ -309,15 +316,21 @@ def tt_probe(
 def tt_store(
     tt_key: np.ndarray, tt_move: np.ndarray, tt_score: np.ndarray, tt_depth: np.ndarray,
     tt_type: np.ndarray, key: int, depth: int, score: int, best_move: int, alpha_orig: int,
-    beta: int,
+    beta: int, ply: int
 ) -> None:
     idx = key & TT_MASK
     if tt_key[idx] == key and tt_depth[idx] > depth:
         return  # no point overwriting a deeper, more valuable search
     node_type = TT_UPPER if score <= alpha_orig else TT_LOWER if score >= beta else TT_EXACT
+    store_score = score
+    # Have to undo adjustments
+    if score > MATE_THRESHOLD:
+        store_score = score + ply
+    elif score < -MATE_THRESHOLD:
+        store_score = score - ply
     tt_key[idx] = key
     tt_move[idx] = best_move
-    tt_score[idx] = score
+    tt_score[idx] = store_score
     tt_depth[idx] = depth
     tt_type[idx] = node_type
 
@@ -370,7 +383,7 @@ def quiescence(
 
     count, checkers = gen_moves_ex(bb, st, buf[ply], 0)
     if count == 0:
-        return -MATE if checkers else 0
+        return -MATE + ply if checkers else 0
 
     if checkers:
         # In check the original searches every legal move, unordered. Left alone.
@@ -385,6 +398,12 @@ def quiescence(
         # The captures are already in this list, in the order gen_captures would have
         # produced them, so compact them in place rather than generating a second time.
         count = _keep_captures(sq, buf[ply], count)
+        kept = 0
+        for i in range(count):
+            if see(bb, sq, buf[ply, i]) >= 0:
+                buf[ply, kept] = buf[ply, i]
+                kept += 1
+        count = kept
         for i in range(count):
             scores[ply, i] = _order_score(sq, buf[ply, i], butterfly, killers, ply)
         ordered = True
@@ -394,9 +413,9 @@ def quiescence(
             _select(buf[ply], scores[ply], i, count)
         move = buf[ply, i]
         us = st[0]
-        off, on = features_halfkp.halfkp_deltas_bb(sq, st, move, king_sq[ply, 0], king_sq[ply, 1])
+        off, on = move_deltas(sq, st, move, king_sq[ply, 0], king_sq[ply, 1])
         make_move(bb, sq, st, move, hist, ply)
-        _apply_move_nnue(stack, king_sq, ply, sq, us, move, w1, b1, off, on)
+        apply_move_nnue(stack, king_sq, ply, sq, us, move, w1, b1, off, on)
         score = -quiescence(
             bb, sq, st, -beta, -alpha, qdepth - 1, ply + 1, buf, scores, hist, ctrl,
             stack, king_sq, w1, b1, w2, b2, w3, b3, butterfly, killers
@@ -478,20 +497,25 @@ def negamax(
 
     alpha_orig = alpha
     found, found_score, hash_move = tt_probe(
-        tt_key, tt_move, tt_score, tt_depth, tt_type, key, depth, alpha, beta
+        tt_key, tt_move, tt_score, tt_depth, tt_type, key, depth, alpha, beta, ply
     )
     if found:
         return found_score, hash_move
 
     count, checkers = gen_moves_ex(bb, st, buf[ply], 0)
     if count == 0:
-        return (-MATE if checkers else 0), -1
+        return (-MATE + ply if checkers else 0), -1
 
-    if not checkers and depth <= RFP_DEPTH_LIMIT:
-        static_eval = nnue_evaluate(stack, ply, st, w2, b2, w3, b3)
-        margin = RFP_MARGIN * depth
-        if static_eval - margin >= beta:
-            return static_eval - margin, -1
+    static_eval = 0
+    not_too_deep = depth <= max(RFP_DEPTH_LIMIT, FUTILITY_DEPTH_LIMIT)
+    within_bounds = abs(alpha) < MATE_THRESHOLD and abs(beta) < MATE_THRESHOLD
+    if not checkers and not_too_deep and within_bounds:
+        # static_eval = nnue_evaluate(stack, ply, st, w2, b2, w3, b3)
+        static_eval = evaluate(bb, st, count)
+        if depth <= RFP_DEPTH_LIMIT:
+            margin = RFP_MARGIN * depth
+            if static_eval - margin >= beta:
+                return static_eval - margin, -1
     
     if not checkers and depth >= 3 and has_non_pawn_material(bb, st[0]):
         hash_delta = ZOBRIST_SIDE
@@ -529,15 +553,20 @@ def negamax(
         us = st[0]
 
         is_quiet = sq[(move >> 6) & 63] < 0
-        if is_quiet and not checkers and depth <= LMP_DEPTH_LIMIT and quiets_tried >= (3 + depth * depth):
+        if (is_quiet and not checkers and depth <= LMP_DEPTH_LIMIT 
+                and quiets_tried >= (3 + depth * depth)):
+            continue
+        if (is_quiet and not checkers and depth <= FUTILITY_DEPTH_LIMIT
+                and best_move != -1 and abs(alpha) < MATE_THRESHOLD
+                and static_eval + FUTILITY_MARGIN * depth <= alpha):
             continue
         if is_quiet:
             quiets_tried += 1
 
-        off, on = features_halfkp.halfkp_deltas_bb(sq, st, move, king_sq[ply, 0], king_sq[ply, 1])
+        off, on = move_deltas(sq, st, move, king_sq[ply, 0], king_sq[ply, 1])
         hash_delta = zobrist_delta_bb(sq, st, move)
         make_move(bb, sq, st, move, hist, ply)
-        _apply_move_nnue(stack, king_sq, ply, sq, us, move, w1, b1, off, on)
+        apply_move_nnue(stack, king_sq, ply, sq, us, move, w1, b1, off, on)
         hash_stack[ply + 1] = hash_stack[ply] ^ hash_delta
         reduction = _lmr_reduction(depth, i) if (is_quiet and not checkers) else 0
         child_score, _ = negamax(
@@ -577,13 +606,13 @@ def negamax(
                     killers[ply, 0] = move
             tt_store(
                 tt_key, tt_move, tt_score, tt_depth, tt_type,
-                key, depth, score, move, alpha_orig, beta,
+                key, depth, score, move, alpha_orig, beta, ply 
             )
             return score, move
 
     tt_store(
         tt_key, tt_move, tt_score, tt_depth, tt_type,
-        key, depth, best, best_move, alpha_orig, beta,
+        key, depth, best, best_move, alpha_orig, beta, ply
     )
     return best, best_move
 
@@ -628,10 +657,7 @@ def think(
     reached = 0
     value = 0
 
-    white_king, black_king = features_halfkp.find_king_squares(sq)
-    king_sq[0, 0] = white_king
-    king_sq[0, 1] = black_king
-    nnue.refresh(stack[0], W1, B1, features_halfkp.halfkp_active_bb(sq, white_king, black_king))
+    root_refresh(stack, king_sq, sq, W1, B1)
     hash_stack[0] = zobrist_hash_bb(sq, st)
     for depth in range(1, max_depth + 1):
         for i in range(count):
@@ -645,12 +671,10 @@ def think(
             best_score = -INF
             for move in [pv] + [m for m in moves if m != pv]:
                 us = st[0]
-                off, on = features_halfkp.halfkp_deltas_bb(
-                    sq, st, move, king_sq[0, 0], king_sq[0, 1]
-                )
+                off, on = move_deltas(sq, st, move, king_sq[0, 0], king_sq[0, 1])
                 hash_delta = zobrist_delta_bb(sq, st, move)
                 make_move(bb, sq, st, move, hist, 0)
-                _apply_move_nnue(stack, king_sq, 0, sq, us, move, W1, B1, off, on)
+                apply_move_nnue(stack, king_sq, 0, sq, us, move, W1, B1, off, on)
                 hash_stack[1] = hash_stack[0] ^ hash_delta
                 child_score, _ = negamax(
                     bb, sq, st, -beta, -alpha, depth - 1, 1, buf, scores, hist, ctrl,
@@ -760,16 +784,13 @@ def _warm() -> None:
     gen_moves(bb, st, BUF[0], 0)
     move = np.int32(BUF[0, 0])
 
-    white_king, black_king = features_halfkp.find_king_squares(sq)
-    KING_SQ[0, 0] = white_king
-    KING_SQ[0, 1] = black_king
-    nnue.refresh(STACK[0], W1, B1, features_halfkp.halfkp_active_bb(sq, white_king, black_king))
+    root_refresh(STACK, KING_SQ, sq, W1, B1)
     HASH_STACK[0] = zobrist_hash_bb(sq, st)
     us = st[0]
-    off, on = features_halfkp.halfkp_deltas_bb(sq, st, move, KING_SQ[0, 0], KING_SQ[0, 1])
+    off, on = move_deltas(sq, st, move, KING_SQ[0, 0], KING_SQ[0, 1])
     hash_delta = zobrist_delta_bb(sq, st, move)
     make_move(bb, sq, st, move, HIST, 0)
-    _apply_move_nnue(STACK, KING_SQ, 0, sq, us, move, W1, B1, off, on)
+    apply_move_nnue(STACK, KING_SQ, 0, sq, us, move, W1, B1, off, on)
     HASH_STACK[1] = HASH_STACK[0] ^ hash_delta
     negamax(
         bb, sq, st, -INF, INF, 1, 1, BUF, SCORES, HIST, CTRL, STACK, KING_SQ,
