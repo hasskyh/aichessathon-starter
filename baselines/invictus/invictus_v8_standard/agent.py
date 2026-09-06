@@ -32,8 +32,8 @@ import numpy as np
 from numba import njit, objmode
 
 import bitgen
-from nnue_flat_glue import apply_move_nnue, move_deltas, nnue_evaluate, root_refresh
-from nnue_flat_glue import HIDDEN as NNUE_HIDDEN
+from nnue_standard_glue import apply_move_nnue, move_deltas, nnue_evaluate, root_refresh
+from nnue_standard_glue import HIDDEN as NNUE_HIDDEN
 from bitgen import (
     FLAG_EP,
     MAX_MOVES,

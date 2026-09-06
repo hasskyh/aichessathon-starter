@@ -1,9 +1,10 @@
-"""Bridges the search's stack/board representation to the flat/general NNUE
-architecture (nnue.py) and its feature encoding (features.py): 768 features,
-piece-on-square only, no king-relative structure. Standard two-layer 768-512-32-1
-shape (accumulator -> hidden -> output, via nnue.forward) -- the checkpoint this
-loads must have w2/b2, unlike the flat-general baseline's single-layer
-forward_flat checkpoint, which this glue module no longer calls.
+"""Bridges the search's stack/board representation to the standard NNUE
+architecture (nnue_768.py) and its feature encoding (features_768.py): 768
+features, piece-on-square only, no king-relative structure, two-layer
+768-512-32-1 shape (accumulator -> hidden -> output, via nnue.forward). The
+checkpoint this loads must have w2/b2 -- nnue_768.py's OTHER forward variant,
+forward_flat, is the single-layer 768-512-1 architecture (no hidden layer at
+all) and belongs to a separate nnue_flat_glue.py, not this file.
 
 Same shape as nnue_halfkp_glue.py (HIDDEN, nnue_evaluate, apply_move_nnue,
 root_refresh, move_deltas) so agent.py can import either module under the same
@@ -16,8 +17,8 @@ move special case without king-relative features.
 import numpy as np
 from numba import njit
 
-import features_flat as features
-import nnue_flat as nnue
+import features_768 as features
+import nnue_768 as nnue
 
 HIDDEN = nnue.HIDDEN
 
