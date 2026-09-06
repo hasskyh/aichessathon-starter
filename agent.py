@@ -8,6 +8,21 @@
 # The algorithm is a faithful port, deliberately: same evaluation, same alpha-beta,
 # same quiescence depth, same move ordering including its quirks, so the strength
 # difference against invictus_quiesce is speed and nothing else.
+#
+# v7 is invictus_v5 with a HalfKP net (features_halfkp.py, nnue_halfkp.py) instead of
+# the flat 768-feature one -- same TT/null-move/aspiration-window search, same
+# abort-handling fix, only the evaluation changes. HalfKP's features are king-relative
+# (see features_halfkp.py's module docstring), so every one of a perspective's
+# features changes meaning the moment that perspective's own king moves. The search
+# has to know this: KING_SQ tracks both kings' current squares per ply (mirroring
+# STACK's own per-ply convention), and every make-move site below checks whether the
+# mover was a king. A non-king move updates both perspectives incrementally exactly
+# like the flat net does. A king move takes the documented HalfKP protocol instead:
+# the mover's own perspective gets a full refresh (its features are relative to a
+# king square that just changed, so no incremental delta from the old position means
+# anything), while the OTHER perspective -- whose king did not move -- still applies
+# the ordinary incremental delta, which is non-empty exactly when the king move was
+# also a capture or a castle (the rook's own relocation still needs applying there).
 
 import time
 from pathlib import Path
@@ -16,18 +31,18 @@ import numpy as np
 from numba import njit, objmode
 
 import bitgen
-import features
-import nnue
+import features_halfkp
+import nnue_halfkp as nnue
 from bitgen import (
     FLAG_EP,
     MAX_MOVES,
     MAX_PLY,
     gen_moves,
     gen_moves_ex,
+    has_non_pawn_material,
     make_move,
     popcount,
     unmake_move,
-    has_non_pawn_material,
 )
 from zobrist import (
     ZOBRIST_EP,
@@ -86,7 +101,15 @@ GAME_HISTORY_LEN = 0
 
 STACK = np.zeros((MAX_PLY + 1, 2, nnue.HIDDEN), dtype=np.int32)  # the NNUE accumulator stack
 
-_WEIGHTS = np.load(Path(__file__).resolve().parent / "weights" / "nnue.npz")
+# Both kings' current squares at each ply, maintained the same way STACK is: copied
+# down from the parent ply at every make_move, then the mover's own entry corrected
+# in place if (and only if) the move just made was that king's own move. Needed
+# because halfkp_deltas_bb/halfkp_active_bb take king squares as explicit arguments
+# rather than re-deriving them from sq -- find_king_squares exists for exactly the
+# refresh case (root, or a king move) and is deliberately never called elsewhere.
+KING_SQ = np.zeros((MAX_PLY + 1, 2), dtype=np.int32)
+
+_WEIGHTS = np.load(Path(__file__).resolve().parent / "weights" / "nnue_halfkp.npz")
 # np.load on an .npz can hand back a non-writable, non-C-contiguous view (W2 is
 # Fortran-ordered because export.py's transpose preserved that layout through the
 # save/load round trip); np.array() forces an independent, C-contiguous copy.
@@ -158,9 +181,47 @@ def nnue_evaluate(
     """NNUE score for the position at this ply, from the side to move's perspective.
 
     stack[ply] must already reflect this exact position: refreshed once at the
-    root, then kept current by nnue.update at every make_move since.
+    root, then kept current by the king-move-aware update logic at every make_move
+    since (see the module docstring).
     """
     return nnue.forward(stack[ply], st[0], w2, b2, w3, b3)
+
+
+@njit(inline="always", cache=False)
+def _apply_move_nnue(
+    stack: np.ndarray,
+    king_sq: np.ndarray,
+    ply: int,
+    sq: np.ndarray,
+    st_us: int,
+    move: int,
+    w1: np.ndarray,
+    b1: np.ndarray,
+    off: np.ndarray,
+    on: np.ndarray,
+) -> None:
+    """Maintain the accumulator and king-square trackers across one make_move,
+    already applied to bb/sq/st by the caller -- st_us is the mover's colour from
+    BEFORE that flip, sq is the board AFTER it (so bitgen.KING lookups here would
+    see the moved piece, which is why the caller passes off/on and the pre-move
+    king squares rather than this function re-deriving anything from sq itself).
+
+    off/on come from halfkp_deltas_bb, called by the caller BEFORE make_move (its
+    own documented protocol) -- safe to pass here for ANY move, king or not, since
+    a king move's own off/on rows are simply unused on the mover's side below.
+    """
+    stack[ply + 1] = stack[ply]
+    king_sq[ply + 1] = king_sq[ply]
+    moved_piece_is_king = sq[(move >> 6) & 63] % 6 == bitgen.KING
+    if moved_piece_is_king:
+        to_square = (move >> 6) & 63
+        king_sq[ply + 1, st_us] = to_square
+        other = 1 - st_us
+        active = features_halfkp.halfkp_active_bb(sq, king_sq[ply + 1, 0], king_sq[ply + 1, 1])
+        nnue.refresh(stack[ply + 1, st_us:st_us + 1], w1, b1, active[st_us:st_us + 1])
+        nnue.update(stack[ply + 1, other:other + 1], w1, off[other:other + 1], on[other:other + 1])
+    else:
+        nnue.update(stack[ply + 1], w1, off, on)
 
 
 @njit(inline="always", cache=False)
@@ -272,7 +333,9 @@ def quiescence(
     hist: np.ndarray,
     ctrl: np.ndarray,
     stack: np.ndarray,
+    king_sq: np.ndarray,
     w1: np.ndarray,
+    b1: np.ndarray,
     w2: np.ndarray,
     b2: np.ndarray,
     w3: np.ndarray,
@@ -309,13 +372,13 @@ def quiescence(
         if ordered:
             _select(buf[ply], scores[ply], i, count)
         move = buf[ply, i]
-        off, on = features.deltas_bb(sq, st, move)
+        us = st[0]
+        off, on = features_halfkp.halfkp_deltas_bb(sq, st, move, king_sq[ply, 0], king_sq[ply, 1])
         make_move(bb, sq, st, move, hist, ply)
-        stack[ply + 1] = stack[ply]
-        nnue.update(stack[ply + 1], w1, off, on)
+        _apply_move_nnue(stack, king_sq, ply, sq, us, move, w1, b1, off, on)
         score = -quiescence(
             bb, sq, st, -beta, -alpha, qdepth - 1, ply + 1, buf, scores, hist, ctrl,
-            stack, w1, w2, b2, w3, b3, butterfly
+            stack, king_sq, w1, b1, w2, b2, w3, b3, butterfly
         )
         unmake_move(bb, sq, st, move, hist, ply)
         if ctrl[2] != 0.0:
@@ -343,7 +406,9 @@ def negamax(
     hist: np.ndarray,
     ctrl: np.ndarray,
     stack: np.ndarray,
+    king_sq: np.ndarray,
     w1: np.ndarray,
+    b1: np.ndarray,
     w2: np.ndarray,
     b2: np.ndarray,
     w3: np.ndarray,
@@ -371,7 +436,7 @@ def negamax(
         # since this ply never generated or looped over any candidates itself.
         return quiescence(
             bb, sq, st, alpha, beta, QUIESCE_DEPTH, ply, buf, scores, hist, ctrl,
-            stack, w1, w2, b2, w3, b3, butterfly
+            stack, king_sq, w1, b1, w2, b2, w3, b3, butterfly
         ), -1
 
     key = hash_stack[ply]
@@ -405,9 +470,10 @@ def negamax(
             hash_delta ^= ZOBRIST_EP[st[2] & 7]
         make_null_move(st, hist, ply)
         stack[ply + 1] = stack[ply]
+        king_sq[ply + 1] = king_sq[ply]  # a null move never moves anyone's king
         hash_stack[ply + 1] = hash_stack[ply] ^ hash_delta
         child_score, _ = negamax(bb, sq, st, -beta, -beta + 1, depth - 1 - R, ply + 1,
-                                 buf, scores, hist, ctrl, stack, w1, w2, b2, w3, b3,
+                                 buf, scores, hist, ctrl, stack, king_sq, w1, b1, w2, b2, w3, b3,
                                  hash_stack, tt_key, tt_move, tt_score, tt_depth, tt_type,
                                  butterfly, game_history, game_history_len
                             )
@@ -430,15 +496,15 @@ def negamax(
     for i in range(count):
         _select(buf[ply], scores[ply], i, count)
         move = buf[ply, i]
-        off, on = features.deltas_bb(sq, st, move)
+        us = st[0]
+        off, on = features_halfkp.halfkp_deltas_bb(sq, st, move, king_sq[ply, 0], king_sq[ply, 1])
         hash_delta = zobrist_delta_bb(sq, st, move)
         make_move(bb, sq, st, move, hist, ply)
-        stack[ply + 1] = stack[ply]
-        nnue.update(stack[ply + 1], w1, off, on)
+        _apply_move_nnue(stack, king_sq, ply, sq, us, move, w1, b1, off, on)
         hash_stack[ply + 1] = hash_stack[ply] ^ hash_delta
         child_score, _ = negamax(
             bb, sq, st, -beta, -alpha, depth - 1, ply + 1, buf, scores, hist, ctrl,
-            stack, w1, w2, b2, w3, b3, hash_stack,
+            stack, king_sq, w1, b1, w2, b2, w3, b3, hash_stack,
             tt_key, tt_move, tt_score, tt_depth, tt_type, butterfly, game_history, game_history_len
         )
         score = -child_score
@@ -481,6 +547,7 @@ def think(
     hist: np.ndarray,
     ctrl: np.ndarray,
     stack: np.ndarray,
+    king_sq: np.ndarray,
     max_depth: int,
     hash_stack: np.ndarray,
     margin: int,
@@ -506,24 +573,29 @@ def think(
     reached = 0
     value = 0
 
-    nnue.refresh(stack[0], W1, B1, features.active_bb(sq))
+    white_king, black_king = features_halfkp.find_king_squares(sq)
+    king_sq[0, 0] = white_king
+    king_sq[0, 1] = black_king
+    nnue.refresh(stack[0], W1, B1, features_halfkp.halfkp_active_bb(sq, white_king, black_king))
     hash_stack[0] = zobrist_hash_bb(sq, st)
     for depth in range(1, max_depth + 1):
         alpha, beta = (-INF, INF) if depth == 1 else (value - margin, value + margin)
         aborted = False
-        while True: 
+        while True:
             best_move = -1
             best_score = -INF
             for move in [pv] + [m for m in moves if m != pv]:
-                off, on = features.deltas_bb(sq, st, move)
+                us = st[0]
+                off, on = features_halfkp.halfkp_deltas_bb(
+                    sq, st, move, king_sq[0, 0], king_sq[0, 1]
+                )
                 hash_delta = zobrist_delta_bb(sq, st, move)
                 make_move(bb, sq, st, move, hist, 0)
-                stack[1] = stack[0]
-                nnue.update(stack[1], W1, off, on)
+                _apply_move_nnue(stack, king_sq, 0, sq, us, move, W1, B1, off, on)
                 hash_stack[1] = hash_stack[0] ^ hash_delta
                 child_score, _ = negamax(
                     bb, sq, st, -beta, -alpha, depth - 1, 1, buf, scores, hist, ctrl,
-                    stack, W1, W2, B2, W3, B3, hash_stack,
+                    stack, king_sq, W1, B1, W2, B2, W3, B3, hash_stack,
                     TT_KEY, TT_MOVE, TT_SCORE, TT_DEPTH, TT_TYPE,
                     HISTORY, game_history, game_history_len,
                 )
@@ -589,8 +661,8 @@ def get_move(fen: str, time_left_ms: int) -> str:
     CTRL[1] = 0.0
     CTRL[2] = 0.0
     CTRL[3] = CHECK_INTERVAL
-    move, depth, _score = think(bb, sq, st, BUF, SCORES, HIST, CTRL, STACK, MAX_DEPTH, HASH_STACK,
-                                ASPIRATION_MARGIN, GAME_HISTORY, GAME_HISTORY_LEN
+    move, depth, _score = think(bb, sq, st, BUF, SCORES, HIST, CTRL, STACK, KING_SQ, MAX_DEPTH,
+                                HASH_STACK, ASPIRATION_MARGIN, GAME_HISTORY, GAME_HISTORY_LEN
                             )
     last_depth = depth
     last_nodes = CTRL[1]
@@ -614,6 +686,12 @@ def _warm() -> None:
     the search really uses, and the NNUE path (refresh, update, forward) at the real
     weight shapes. Argument types must match the real call exactly, or numba compiles
     a second specialisation later, on the clock.
+
+    This one non-king first move never exercises the king-move-refresh branch inside
+    quiescence/negamax's make-move sites, but numba compiles a jitted function's whole
+    body -- every branch of every `if` -- the first time it is called with a given set
+    of argument types, not lazily by which branch actually runs a given call. Passing
+    b1/king_sq here (matching their real types) is what makes that branch compile too.
     """
     bb, sq, st = bitgen.from_fen(bitgen.STARTING_FEN)
     CTRL[0] = time.monotonic() + 60.0
@@ -623,16 +701,20 @@ def _warm() -> None:
     gen_moves(bb, st, BUF[0], 0)
     move = np.int32(BUF[0, 0])
 
-    nnue.refresh(STACK[0], W1, B1, features.active_bb(sq))
+    white_king, black_king = features_halfkp.find_king_squares(sq)
+    KING_SQ[0, 0] = white_king
+    KING_SQ[0, 1] = black_king
+    nnue.refresh(STACK[0], W1, B1, features_halfkp.halfkp_active_bb(sq, white_king, black_king))
     HASH_STACK[0] = zobrist_hash_bb(sq, st)
-    off, on = features.deltas_bb(sq, st, move)
+    us = st[0]
+    off, on = features_halfkp.halfkp_deltas_bb(sq, st, move, KING_SQ[0, 0], KING_SQ[0, 1])
     hash_delta = zobrist_delta_bb(sq, st, move)
     make_move(bb, sq, st, move, HIST, 0)
-    STACK[1] = STACK[0]
-    nnue.update(STACK[1], W1, off, on)
+    _apply_move_nnue(STACK, KING_SQ, 0, sq, us, move, W1, B1, off, on)
     HASH_STACK[1] = HASH_STACK[0] ^ hash_delta
     negamax(
-        bb, sq, st, -INF, INF, 1, 1, BUF, SCORES, HIST, CTRL, STACK, W1, W2, B2, W3, B3, HASH_STACK,
+        bb, sq, st, -INF, INF, 1, 1, BUF, SCORES, HIST, CTRL, STACK, KING_SQ,
+        W1, B1, W2, B2, W3, B3, HASH_STACK,
         TT_KEY, TT_MOVE, TT_SCORE, TT_DEPTH, TT_TYPE, HISTORY, GAME_HISTORY, GAME_HISTORY_LEN
     )
     unmake_move(bb, sq, st, move, HIST, 0)
