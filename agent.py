@@ -568,6 +568,11 @@ def think(
     if count == 0:
         return -1, 0, 0
 
+    for i in range(count):
+        scores[0, i] = _order_score(sq, buf[0, i], HISTORY)
+    for i in range(count):
+        _select(buf[0], scores[0], i, count)
+
     moves = [np.int32(buf[0, i]) for i in range(count)]
     pv = moves[0]
     reached = 0
@@ -579,6 +584,10 @@ def think(
     nnue.refresh(stack[0], W1, B1, features_halfkp.halfkp_active_bb(sq, white_king, black_king))
     hash_stack[0] = zobrist_hash_bb(sq, st)
     for depth in range(1, max_depth + 1):
+        for i in range(count):
+            scores[0, i] = _order_score(sq, buf[0, i], HISTORY)
+        for i in range(count):
+            _select(buf[0], scores[0], i, count)
         alpha, beta = (-INF, INF) if depth == 1 else (value - margin, value + margin)
         aborted = False
         while True:
@@ -616,14 +625,14 @@ def think(
                 beta = INF
                 continue
             break
-        # An aborted scan is still salvageable if what it found so far already cleared
-        # the window -- that's a genuine validated score, not a fail-low bound, so a
-        # well-ordered partial result really can beat the previous depth here. But if
-        # best_score never cleared alpha, every score examined is an unresolved bound
-        # (the same condition that would have triggered a widen-and-retry had there
-        # been time), and comparing bounds against each other is meaningless -- discard
-        # the whole depth in that case, same as the fully-aborted case always did.
-        if aborted and best_score <= alpha:
+        # A scan that is aborted mid iteration is still better than the previous
+        # iteration. It will have searched the move we were going to recommend 
+        # anyway. If it found that it's still the best, then there's no issue,
+        # and if it turns out it's not that good at high depth then we wouldn't
+        # want to play it anyway. However, if it failed outside of the bounds, the
+        # score it gives is not actually accurate, and we can't order things based
+        # on that, so we have to discard it.
+        if aborted and not (alpha < best_score < beta):
             break
         if best_move != -1:
             pv = best_move
