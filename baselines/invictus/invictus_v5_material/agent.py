@@ -8,6 +8,9 @@
 # The algorithm is a faithful port, deliberately: same evaluation, same alpha-beta,
 # same quiescence depth, same move ordering including its quirks, so the strength
 # difference against invictus_quiesce is speed and nothing else.
+# 
+# Disappointingly, this is the best agent created so far, despite all the effort
+# spent on getting NNUEs to work.
 
 import time
 from pathlib import Path
