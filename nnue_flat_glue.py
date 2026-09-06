@@ -1,6 +1,9 @@
 """Bridges the search's stack/board representation to the flat/general NNUE
-architecture (nnue.py) and its feature encoding (features.py) -- the "small
-general" net: 768 features, piece-on-square only, no king-relative structure.
+architecture (nnue.py) and its feature encoding (features.py): 768 features,
+piece-on-square only, no king-relative structure. Standard two-layer 768-512-32-1
+shape (accumulator -> hidden -> output, via nnue.forward) -- the checkpoint this
+loads must have w2/b2, unlike the flat-general baseline's single-layer
+forward_flat checkpoint, which this glue module no longer calls.
 
 Same shape as nnue_halfkp_glue.py (HIDDEN, nnue_evaluate, apply_move_nnue,
 root_refresh, move_deltas) so agent.py can import either module under the same
@@ -29,12 +32,7 @@ def nnue_evaluate(
     w3: np.ndarray,
     b3: int,
 ) -> int:
-    # w2/b2 accepted but unused: the trained checkpoint this architecture ships
-    # (ckpt-flat-general) has no hidden layer at all, so this calls nnue.py's
-    # single-layer forward_flat, not the two-layer forward nnue_halfkp_glue.py
-    # uses -- kept in the signature purely so every agent.py call site is
-    # identical regardless of which glue module is imported.
-    return nnue.forward_flat(stack[ply], st[0], w3, b3)
+    return nnue.forward(stack[ply], st[0], w2, b2, w3, b3)
 
 
 @njit(inline="always", cache=False)
