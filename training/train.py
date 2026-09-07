@@ -149,7 +149,7 @@ def main() -> None:
     torch.set_num_threads(8)
     idx, target = load_arrays(arguments.data_dir, arguments.rows)
 
-    ids = np.random.permutation(len(idx))
+    ids = np.random.default_rng(0).permutation(len(idx))  # fixed seed: consistent val/train split across resumed invocations
     n_val = int(len(idx) * arguments.val_fraction)
     val_ids = ids[:n_val]
     train_ids = ids[n_val:]
