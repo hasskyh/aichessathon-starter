@@ -26,6 +26,7 @@ from bitgen import (
 )
 from zobrist import (
     ZOBRIST_EP,
+    ZOBRIST_PIECE,
     ZOBRIST_SIDE,
     zobrist_delta_bb,
     zobrist_hash_bb,
@@ -948,7 +949,7 @@ def _warm() -> None:
     HASH_STACK[1] = HASH_STACK[0] ^ hash_delta
     negamax(
         bb, sq, st, -INF, INF, 1, 1, BUF, SCORES, HIST, CTRL, STACK, KING_SQ,
-        W1, B1, W2, B2, W3, B3, HASH_STACK, STAT_STACK, CONT_HIST, MOVE_STACK, PAWN_CORRECTION_HIST,
+        W1, B1, W2, B2, W3, B3, HASH_STACK, STATIC_EVAL_STACK, CONT_HIST, MOVE_STACK, PAWN_CORRECTION_HIST,
         TT_KEY, TT_MOVE, TT_SCORE, TT_DEPTH, TT_TYPE, HISTORY, CAP_HIST, GAME_HISTORY, GAME_HISTORY_LEN, KILLERS
     )
     unmake_move(bb, sq, st, move, HIST, 0)
