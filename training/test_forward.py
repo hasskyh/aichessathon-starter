@@ -8,8 +8,8 @@ import chess
 import numpy as np
 
 sys.path.insert(0, str(Path.home() / "aichessathon-starter"))
-import features
-import nnue
+import features_768 as features
+import nnue_768 as nnue
 
 rng = np.random.default_rng(5)
 W1 = rng.integers(-64, 64, size=(nnue.FEATURES, nnue.HIDDEN), dtype=np.int16)

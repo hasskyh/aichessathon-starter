@@ -33,7 +33,7 @@ from pathlib import Path
 import chess
 import numpy as np
 
-import features
+import features_768 as features
 
 SIGMOID_SCALE = 400.0
 MAX_FEATURES = 32  # one board can hold at most 32 pieces

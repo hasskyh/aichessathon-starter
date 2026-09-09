@@ -510,8 +510,7 @@ def negamax(
     not_too_deep = depth <= max(RFP_DEPTH_LIMIT, FUTILITY_DEPTH_LIMIT)
     within_bounds = abs(alpha) < MATE_THRESHOLD and abs(beta) < MATE_THRESHOLD
     if not checkers and not_too_deep and within_bounds:
-        # static_eval = nnue_evaluate(stack, ply, st, w2, b2, w3, b3)
-        static_eval = evaluate(bb, st, count)
+        static_eval = nnue_evaluate(stack, ply, st, w2, b2, w3, b3)
         if depth <= RFP_DEPTH_LIMIT:
             margin = RFP_MARGIN * depth
             if static_eval - margin >= beta:

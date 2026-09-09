@@ -15,7 +15,7 @@ import chess
 import numpy as np
 import torch
 
-import features
+import features_768 as features
 from training.train import NNUE, remap
 
 SIGMOID_SCALE = 400.0

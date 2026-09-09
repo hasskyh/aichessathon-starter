@@ -13,7 +13,7 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-from nnue import FEATURES, HIDDEN
+from nnue_768 import FEATURES, HIDDEN
 
 OUTPUTS = 32
 KEPT_ROWS = 11_085_978  # pack.py preallocated 11,086,606; the last 628 are dead padding

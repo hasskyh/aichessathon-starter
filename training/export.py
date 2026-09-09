@@ -14,8 +14,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-import nnue
-from nnue import ACT_MAX, FEATURES, HIDDEN_SHIFT
+import nnue_768 as nnue
+from nnue_768 import ACT_MAX, FEATURES, HIDDEN_SHIFT
 from training.train import ACCUMULATOR_NORM, KEPT_ROWS, NNUE, load_arrays, prepare_batch
 
 WEIGHT_SCALE = 2 ** HIDDEN_SHIFT        # 64

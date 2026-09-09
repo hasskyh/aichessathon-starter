@@ -1,28 +1,4 @@
-# The invictus_quiesce search, unchanged in behaviour, moved onto bitgen's bitboards.
-#
-# The search itself has to be jitted, not just move generation. A jitted generator
-# called from a Python search still pays interpreter overhead at every node, which is
-# most of the cost, so the whole tree walk lives in nopython mode here and Python is
-# entered exactly twice per move: once to parse the fen, once to format the reply.
-#
-# The algorithm is a faithful port, deliberately: same evaluation, same alpha-beta,
-# same quiescence depth, same move ordering including its quirks, so the strength
-# difference against invictus_quiesce is speed and nothing else.
-#
-# v7 is invictus_v5 with a HalfKP net (features_halfkp.py, nnue_halfkp.py) instead of
-# the flat 768-feature one -- same TT/null-move/aspiration-window search, same
-# abort-handling fix, only the evaluation changes. HalfKP's features are king-relative
-# (see features_halfkp.py's module docstring), so every one of a perspective's
-# features changes meaning the moment that perspective's own king moves. The search
-# has to know this: KING_SQ tracks both kings' current squares per ply (mirroring
-# STACK's own per-ply convention), and every make-move site below checks whether the
-# mover was a king. A non-king move updates both perspectives incrementally exactly
-# like the flat net does. A king move takes the documented HalfKP protocol instead:
-# the mover's own perspective gets a full refresh (its features are relative to a
-# king square that just changed, so no incremental delta from the old position means
-# anything), while the OTHER perspective -- whose king did not move -- still applies
-# the ordinary incremental delta, which is non-empty exactly when the king move was
-# also a capture or a castle (the rook's own relocation still needs applying there).
+# v9 has fully implemented all common search optimisations.
 
 import time
 import math
@@ -61,15 +37,22 @@ MATE = 1_000_000
 MATE_THRESHOLD = MATE - MAX_PLY # Anything larger than this is mate, but closer mates are better
 FUTILITY_DEPTH_LIMIT = 6
 FUTILITY_MARGIN = 150
+DELTA_MARGIN = 150
 
 INF = 1 << 30
 QUIESCE_DEPTH = 6
 MAX_DEPTH = 64
-R = 2 # How deep to null move prune
+R = 2                   # How deep to null move prune
 ASPIRATION_MARGIN = 50
 LMP_DEPTH_LIMIT = 8
 RFP_DEPTH_LIMIT = 6
-RFP_MARGIN = 120 # Slightly more than a pawn per remaining ply
+RFP_MARGIN = 120        # Slightly more than a pawn per remaining ply
+IIR_DEPTH_LIMIT = 4     # We don't want to reduce depth if we haven't searched very far yet
+SE_DEPTH_LIMIT = 8      # Since search extensions are expensive, we only want to use them at deep nodes
+SE_TT_DEPTH_MARGIN = 3  # the TT entry must be this close to the current depth
+SE_MARGIN = 2           # per depth margin below the TT score for the verification window
+MULTICUT_THRESHOLD = 3  # if we get this many independent fail highs, then we prune the node
+
 
 # ctrl[0] deadline, ctrl[1] nodes, ctrl[2] abort flag, ctrl[3] next node to check the
 # clock at. Counting down to a checkpoint beats a modulo on every node.
@@ -104,6 +87,25 @@ HISTORY_CAP = 80 # Capped score so that it's never more than a capture, no matte
 # early in similar positions
 KILLERS = np.full((MAX_PLY + 1, 2), -1, dtype=np.int32)
 KILLER_SCORE = 90 
+
+# Continuation history basically keeps a table of "when this was played, how well did this do back?"
+# [prev_piece_type, prev_to_sq, curr_piece_type, curr_to_sq]
+CONT_HIST = np.zeros((6, 64, 6, 64), dtype=np.int64)
+# the move that led to ply p, or -1 if none
+MOVE_STACK = np.full(MAX_PLY, -1, dtype=np.int32)
+
+# [attacker_piece_type, victim_piece_type, to_square]
+CAP_HIST = np.zeros((6, 6, 64), dtype=np.int64)
+CAP_HISTORY_CAP = 60 # smaller than the typical SEE adjustment 
+
+# Correction history is meant to compensate for any biases in a pawn structure an NNUE might have.
+# It is not needed in material or handcrafted evaluations
+CORRECTION_HIST_SIZE = 16384    # this is a power of 2 for cheap masking. 2*16384*8 bytes = 262KB
+CORRECTION_HIST_MASK = CORRECTION_HIST_SIZE - 1
+PAWN_CORRECTION_HIST = np.zeros((2, CORRECTION_HIST_SIZE), dtype=np.int64) # [side_to_move, pawn_key & mask]
+CORRECTION_CLAMP = 512          # cap on any single update's contribution
+CORRECTION_DIVISOR = 1024       # scales the raw accumulated sum down to something usable
+CORRECTION_CAP = 64             # cap on the final correction applied to static eval
 
 # Repetition detection. Bounded at 101: the halfmove clock (st[3]) resets to 0 on every
 # irreversible move (pawn push or capture), and a repetition can never reach back across
@@ -195,15 +197,37 @@ def evaluate(bb: np.ndarray, st: np.ndarray, mobility: int) -> int:
 
 
 @njit(inline="always", cache=False)
-def _order_score(sq: np.ndarray, move: int, butterfly: np.ndarray, killers: np.ndarray, ply: int) -> int:
+def _order_score(bb: np.ndarray, 
+                 sq: np.ndarray, 
+                 move: int, 
+                 butterfly: np.ndarray, 
+                 cap_hist: np.ndarray,
+                 killers: np.ndarray, 
+                 ply: int,
+                 cont_hist: np.ndarray,
+                 move_stack: np.ndarray,
+                 ) -> int:
     victim = sq[(move >> 6) & 63]
     if victim < 0:
         if move == killers[ply, 0] or move == killers[ply, 1]:
             return KILLER_SCORE
         us = sq[move & 63] // 6
-        return min(butterfly[us, move & 63, (move >> 6) & 63], HISTORY_CAP)
-    attacker = sq[move & 63] % 6
-    return PIECE_VALUE[victim % 6] - attacker
+        score = butterfly[us, move & 63, (move >> 6) & 63]
+        prev_move = move_stack[ply]
+        prev_move2 = move_stack[ply - 1] if ply >= 1 else -1
+        if prev_move != -1:
+            prev_piece = sq[(prev_move >> 6) & 63] % 6
+            curr_piece = sq[move & 63] % 6
+            score += cont_hist[prev_piece, (prev_move >> 6) & 63, curr_piece, (move >> 6) & 63]
+        if prev_move2 != -1:
+            prev_piece2 = sq[(prev_move2 >> 6) & 63] % 6
+            curr_piece2 = sq[move & 63] % 6
+            score += cont_hist[prev_piece2, (prev_move2 >> 6) & 63, curr_piece2, (move >> 6) & 63]
+        return min(score, HISTORY_CAP)
+    attacker_type = sq[move & 63] % 6
+    victim_type = victim % 6
+    bonus = min(cap_hist[attacker_type, victim_type, (move >> 6) & 63], CAP_HISTORY_CAP)
+    return see(bb, sq, move) + bonus
 
 
 @njit(inline="always", cache=False)
@@ -287,6 +311,17 @@ def _keep_captures(sq: np.ndarray, moves: np.ndarray, count: int) -> int:
             moves[kept] = move
             kept += 1
     return kept
+
+@njit(inline="always", cache=False)
+def pawn_structure_key(bb: np.ndarray) -> np.uint64:
+    key = np.uint64(0)
+    for side in range(2):
+        occ = bb[side * 6]
+        while occ:
+            sq = lsb(occ)
+            key ^= ZOBRIST_PIECE[side * 6, sq]
+            occ ^= bit(sq)
+    return key
 
 @njit(inline="always", cache=False)
 def tt_probe(
@@ -391,6 +426,10 @@ def quiescence(
         ordered = False
     else:
         best = nnue_evaluate(stack, ply, st, w2, b2, w3, b3)
+        pawn_idx = pawn_structure_key(bb) & CORRECTION_HIST_MASK
+        correction = PAWN_CORRECTION_HIST[st[0], pawn_idx] // CORRECTION_DIVISOR
+        correction = max(-CORRECTION_CAP, min(CORRECTION_CAP, correction))
+        best += correction
         if best >= beta or qdepth == 0:
             return best
         if best > alpha:
@@ -405,13 +444,19 @@ def quiescence(
                 kept += 1
         count = kept
         for i in range(count):
-            scores[ply, i] = _order_score(sq, buf[ply, i], butterfly, killers, ply)
+            scores[ply, i] = _order_score(bb, sq, buf[ply, i], butterfly, CAP_HIST, killers, ply, CONT_HIST, MOVE_STACK)
         ordered = True
 
     for i in range(count):
         if ordered:
             _select(buf[ply], scores[ply], i, count)
         move = buf[ply, i]
+
+        if ordered and abs(alpha) < MATE_THRESHOLD:
+            victim = sq[(move >> 6) & 63]
+            if best + PIECE_VALUE[victim % 6] + DELTA_MARGIN <= alpha:
+                continue
+
         us = st[0]
         off, on = move_deltas(sq, st, move, king_sq[ply, 0], king_sq[ply, 1])
         make_move(bb, sq, st, move, hist, ply)
@@ -454,12 +499,17 @@ def negamax(
     w3: np.ndarray,
     b3: int,
     hash_stack: np.ndarray,
+    stat_stack: np.ndarray,
+    cont_hist: np.ndarray,
+    move_stack: np.ndarray,
+    pawn_correction_hist: np.ndarray,
     tt_key: np.ndarray,
     tt_move: np.ndarray,
     tt_score: np.ndarray,
     tt_depth: np.ndarray,
     tt_type: np.ndarray,
     butterfly: np.ndarray,
+    cap_hist: np.ndarray,
     game_history: np.ndarray,
     game_history_len: int,
     killers: np.ndarray,
@@ -502,21 +552,38 @@ def negamax(
     if found:
         return found_score, hash_move
 
+    if hash_move == -1 and depth >= IIR_DEPTH_LIMIT:
+        depth -= 1
+
     count, checkers = gen_moves_ex(bb, st, buf[ply], 0)
     if count == 0:
         return (-MATE + ply if checkers else 0), -1
 
-    static_eval = 0
+    if checkers and ply < MAX_PLY - 2:
+        depth += 1
+
+    if checkers:
+        stat_stack[ply] = STATIC_EVAL_NONE
+        static_eval = 0
+    else:
+        static_eval = nnue_evaluate(stack, ply, st, w2, b2, w3, b3)
+        pawn_key = pawn_structure_key(bb)
+        pawn_idx = pawn_key & CORRECTION_HIST_MASK
+        correction = pawn_correction_hist[st[0], pawn_idx] // CORRECTION_DIVISOR
+        correction = max(-CORRECTION_CAP, min(CORRECTION_CAP, correction))
+        static_eval += correction
+        stat_stack[ply] = static_eval
+
+    improving = (checkers or ply < 2 or stat_stack[ply - 2] == STATIC_EVAL_NONE
+                or static_eval > stat_stack[ply - 2])
+
     not_too_deep = depth <= max(RFP_DEPTH_LIMIT, FUTILITY_DEPTH_LIMIT)
     within_bounds = abs(alpha) < MATE_THRESHOLD and abs(beta) < MATE_THRESHOLD
-    if not checkers and not_too_deep and within_bounds:
-        # static_eval = nnue_evaluate(stack, ply, st, w2, b2, w3, b3)
-        static_eval = evaluate(bb, st, count)
-        if depth <= RFP_DEPTH_LIMIT:
-            margin = RFP_MARGIN * depth
-            if static_eval - margin >= beta:
-                return static_eval - margin, -1
-    
+    if not checkers and not_too_deep and within_bounds and depth <= RFP_DEPTH_LIMIT:
+        margin = RFP_MARGIN * (depth - improving)
+        if static_eval - margin >= beta:
+            return static_eval - margin, -1
+
     if not checkers and depth >= 3 and has_non_pawn_material(bb, st[0]):
         hash_delta = ZOBRIST_SIDE
         if st[2] >= 0:
@@ -525,10 +592,11 @@ def negamax(
         stack[ply + 1] = stack[ply]
         king_sq[ply + 1] = king_sq[ply]  # a null move never moves anyone's king
         hash_stack[ply + 1] = hash_stack[ply] ^ hash_delta
+        move_stack[ply + 1] = -1
         child_score, _ = negamax(bb, sq, st, -beta, -beta + 1, depth - 1 - R, ply + 1,
                                  buf, scores, hist, ctrl, stack, king_sq, w1, b1, w2, b2, w3, b3,
-                                 hash_stack, tt_key, tt_move, tt_score, tt_depth, tt_type,
-                                 butterfly, game_history, game_history_len, killers
+                                 hash_stack, stat_stack, cont_hist, move_stack, pawn_correction_hist, tt_key, tt_move, tt_score, tt_depth, tt_type,
+                                 butterfly, cap_hist, game_history, game_history_len, killers
                             )
         score = - child_score
         unmake_null_move(st, hist, ply)
@@ -536,8 +604,50 @@ def negamax(
             return 0, -1
         if score >= beta:
             return score, -1
+
+    extension = 0
+    if (hash_move != -1 and not checkers and depth >= SE_DEPTH_LIMIT
+        and abs(beta) < MATE_THRESHOLD):
+        tt_idx = key & TT_MASK
+        tt_entry_score = tt_score[tt_idx]
+        if tt_entry_score > MATE_THRESHOLD:
+            tt_entry_score -= ply
+        elif tt_entry_score < -MATE_THRESHOLD:
+            tt_entry_score += ply
+        if tt_depth[tt_idx] >= depth - SE_TT_DEPTH_MARGIN and tt_type[tt_idx] != TT_UPPER:
+            singular_beta = tt_entry_score - SE_MARGIN * depth
+            singular_depth = (depth - 1) // 2
+            fail_high_count = 0
+            for i in range(count):
+                move = buf[ply, i]
+                if move == hash_move:
+                    continue
+                us = st[0]
+                off, on = move_deltas(sq, st, move, king_sq[ply, 0], king_sq[ply, 1])
+                hash_delta = zobrist_delta_bb(sq, st, move)
+                make_move(bb, sq, st, move, hist, ply)
+                apply_move_nnue(stack, king_sq, ply, sq, us, move, w1, b1, off, on)
+                hash_stack[ply + 1] = hash_stack[ply] ^ hash_delta
+                move_stack[ply + 1] = move
+                child_score, _ = negamax(
+                    bb, sq, st, -singular_beta - 1, -singular_beta, singular_depth, ply + 1, buf, scores, hist, ctrl,
+                    stack, king_sq, w1, b1, w2, b2, w3, b3, hash_stack, stat_stack,
+                    cont_hist, move_stack, pawn_correction_hist, tt_key, tt_move, tt_score, tt_depth, tt_type, butterfly, cap_hist,
+                    game_history, game_history_len, killers,
+                )
+                score = -child_score
+                unmake_move(bb, sq, st, move, hist, ply)
+                if ctrl[2] != 0.0:
+                    return 0, -1
+                if score >= singular_beta:
+                    fail_high_count += 1
+                    if fail_high_count >= MULTICUT_THRESHOLD:
+                        return singular_beta, -1
+            if fail_high_count == 0:
+                extension = 1
+
     for i in range(count):
-        scores[ply, i] = _order_score(sq, buf[ply, i], butterfly, killers, ply)
+        scores[ply, i] = _order_score(bb, sq, buf[ply, i], butterfly, cap_hist, killers, ply, cont_hist, move_stack)
     if hash_move != -1:
         for i in range(count):
             if buf[ply, i] == hash_move:
@@ -553,12 +663,13 @@ def negamax(
         us = st[0]
 
         is_quiet = sq[(move >> 6) & 63] < 0
+        lmp_limit = (3 + depth * depth) if improving else (3 + depth * depth) // 2
         if (is_quiet and not checkers and depth <= LMP_DEPTH_LIMIT 
-                and quiets_tried >= (3 + depth * depth)):
+                and quiets_tried >= lmp_limit):
             continue
         if (is_quiet and not checkers and depth <= FUTILITY_DEPTH_LIMIT
                 and best_move != -1 and abs(alpha) < MATE_THRESHOLD
-                and static_eval + FUTILITY_MARGIN * depth <= alpha):
+                and static_eval + FUTILITY_MARGIN * (depth - improving) <= alpha):
             continue
         if is_quiet:
             quiets_tried += 1
@@ -568,22 +679,44 @@ def negamax(
         make_move(bb, sq, st, move, hist, ply)
         apply_move_nnue(stack, king_sq, ply, sq, us, move, w1, b1, off, on)
         hash_stack[ply + 1] = hash_stack[ply] ^ hash_delta
+        move_stack[ply + 1] = move
         reduction = _lmr_reduction(depth, i) if (is_quiet and not checkers) else 0
-        child_score, _ = negamax(
-            bb, sq, st, -beta, -alpha, depth - 1 - reduction, ply + 1, buf, scores, hist, ctrl,
-            stack, king_sq, w1, b1, w2, b2, w3, b3, hash_stack,
-            tt_key, tt_move, tt_score, tt_depth, tt_type, butterfly,
-            game_history, game_history_len, killers,
-        )
-        score = -child_score
-        if reduction > 0 and score > alpha:
+
+        if i == 0:
+            this_depth = depth - 1 - reduction
+            if move == hash_move:
+                this_depth += extension
             child_score, _ = negamax(
-                bb, sq, st, -beta, -alpha, depth - 1, ply + 1, buf, scores, hist, ctrl,
-                stack, king_sq, w1, b1, w2, b2, w3, b3, hash_stack,
-                tt_key, tt_move, tt_score, tt_depth, tt_type, butterfly,
+                bb, sq, st, -beta, -alpha, this_depth, ply + 1, buf, scores, hist, ctrl,
+                stack, king_sq, w1, b1, w2, b2, w3, b3, hash_stack, stat_stack, 
+                cont_hist, move_stack, pawn_correction_hist, tt_key, tt_move, tt_score, tt_depth, tt_type, butterfly, cap_hist,
                 game_history, game_history_len, killers,
             )
             score = -child_score
+        else:
+            child_score, _ = negamax(
+                    bb, sq, st, -alpha - 1, -alpha, depth - 1 - reduction, ply + 1, buf, scores, hist, ctrl,
+                    stack, king_sq, w1, b1, w2, b2, w3, b3, hash_stack, stat_stack,
+                    cont_hist, move_stack, pawn_correction_hist, tt_key, tt_move, tt_score, tt_depth, tt_type, butterfly, cap_hist,
+                    game_history, game_history_len, killers,
+                )
+            score = -child_score
+            if reduction > 0 and score > alpha:
+                child_score, _ = negamax(
+                    bb, sq, st, -alpha - 1, -alpha, depth - 1, ply + 1, buf, scores, hist, ctrl,
+                    stack, king_sq, w1, b1, w2, b2, w3, b3, hash_stack, stat_stack,
+                    cont_hist, move_stack, pawn_correction_hist, tt_key, tt_move, tt_score, tt_depth, tt_type, butterfly, cap_hist,
+                    game_history, game_history_len, killers,
+                )
+                score = -child_score
+            if score > alpha and score < beta:
+                child_score, _ = negamax(
+                    bb, sq, st, -beta, -alpha, depth - 1 - reduction, ply + 1, buf, scores, hist, ctrl,
+                    stack, king_sq, w1, b1, w2, b2, w3, b3, hash_stack, stat_stack,
+                    cont_hist, move_stack, pawn_correction_hist, tt_key, tt_move, tt_score, tt_depth, tt_type, butterfly, cap_hist,
+                    game_history, game_history_len, killers,
+                )
+                score = -child_score
         unmake_move(bb, sq, st, move, hist, ply)
         if ctrl[2] != 0.0:
             # The search was cut short by the clock -- score is whatever a partial,
@@ -598,18 +731,36 @@ def negamax(
         if score >= beta:
             # This move caused the cutoff, so it -- not whatever the loop was on
             # before -- is the refutation worth remembering here.
-            if sq[(move >> 6) & 63] < 0: # Meaning this is not a capture
+            if is_quiet: # Meaning this is not a capture
                 us = sq[move & 63] // 6  # Mover's colour
                 butterfly[us, move & 63, (move >> 6) & 63] += depth * depth
+                prev_move = move_stack[ply]
+                if prev_move != -1:
+                    prev_piece = sq[(prev_move >> 6) & 63] % 6
+                    curr_piece = sq[move & 63] % 6
+                    cont_hist[prev_piece, (prev_move >> 6) & 63, curr_piece, (move >> 6) & 63] += depth * depth
                 if move != killers[ply, 0]:
                     killers[ply, 1] = killers[ply, 0]
                     killers[ply, 0] = move
+            else:
+                attacker_type = sq[move & 63] % 6
+                victim_type = sq[(move >> 6) & 63] % 6
+                cap_hist[attacker_type, victim_type, (move >> 6) & 63] += depth * depth
+            if not checkers:
+                error = score - static_eval
+                error = max(-CORRECTION_CLAMP, min(CORRECTION_CLAMP, error))
+                pawn_idx = pawn_key & CORRECTION_HIST_MASK
+                pawn_correction_hist[st[0], pawn_idx] += error
             tt_store(
                 tt_key, tt_move, tt_score, tt_depth, tt_type,
                 key, depth, score, move, alpha_orig, beta, ply 
             )
             return score, move
-
+    if not checkers:
+        error = best - static_eval
+        error = max(-CORRECTION_CLAMP, min(CORRECTION_CLAMP, error))
+        pawn_idx =pawn_key & CORRECTION_HIST_MASK
+        pawn_correction_hist[st[0], pawn_idx] += error
     tt_store(
         tt_key, tt_move, tt_score, tt_depth, tt_type,
         key, depth, best, best_move, alpha_orig, beta, ply
@@ -648,7 +799,7 @@ def think(
         return -1, 0, 0
 
     for i in range(count):
-        scores[0, i] = _order_score(sq, buf[0, i], HISTORY, KILLERS, 0,)
+        scores[0, i] = _order_score(bb, sq, buf[0, i], HISTORY, CAP_HIST, KILLERS, 0, CONT_HIST, MOVE_STACK)
     for i in range(count):
         _select(buf[0], scores[0], i, count)
 
@@ -661,7 +812,7 @@ def think(
     hash_stack[0] = zobrist_hash_bb(sq, st)
     for depth in range(1, max_depth + 1):
         for i in range(count):
-            scores[0, i] = _order_score(sq, buf[0, i], HISTORY, KILLERS, 0)
+            scores[0, i] = _order_score(bb, sq, buf[0, i], HISTORY, CAP_HIST, KILLERS, 0, CONT_HIST, MOVE_STACK)
         for i in range(count):
             _select(buf[0], scores[0], i, count)
         alpha, beta = (-INF, INF) if depth == 1 else (value - margin, value + margin)
@@ -678,9 +829,9 @@ def think(
                 hash_stack[1] = hash_stack[0] ^ hash_delta
                 child_score, _ = negamax(
                     bb, sq, st, -beta, -alpha, depth - 1, 1, buf, scores, hist, ctrl,
-                    stack, king_sq, W1, B1, W2, B2, W3, B3, hash_stack,
-                    TT_KEY, TT_MOVE, TT_SCORE, TT_DEPTH, TT_TYPE,
-                    HISTORY, game_history, game_history_len, KILLERS
+                    stack, king_sq, W1, B1, W2, B2, W3, B3, hash_stack, STATIC_EVAL_STACK,
+                    CONT_HIST, MOVE_STACK, PAWN_CORRECTION_HIST, TT_KEY, TT_MOVE, TT_SCORE, TT_DEPTH, TT_TYPE,
+                    HISTORY, CAP_HIST, game_history, game_history_len, KILLERS
                 )
                 score = -child_score
                 unmake_move(bb, sq, st, move, hist, 0)
@@ -722,6 +873,9 @@ BUF = np.zeros((MAX_PLY, MAX_MOVES), dtype=np.int32)
 SCORES = np.zeros((MAX_PLY, MAX_MOVES), dtype=np.int64)
 HIST = np.zeros((MAX_PLY, 4), dtype=np.int64)
 CTRL = np.zeros(4, dtype=np.float64)
+
+STATIC_EVAL_NONE = -MATE - 1
+STATIC_EVAL_STACK = np.zeros(MAX_PLY, dtype=np.int64)
 
 last_depth = 0
 last_nodes = 0.0
@@ -794,8 +948,8 @@ def _warm() -> None:
     HASH_STACK[1] = HASH_STACK[0] ^ hash_delta
     negamax(
         bb, sq, st, -INF, INF, 1, 1, BUF, SCORES, HIST, CTRL, STACK, KING_SQ,
-        W1, B1, W2, B2, W3, B3, HASH_STACK,
-        TT_KEY, TT_MOVE, TT_SCORE, TT_DEPTH, TT_TYPE, HISTORY, GAME_HISTORY, GAME_HISTORY_LEN, KILLERS
+        W1, B1, W2, B2, W3, B3, HASH_STACK, STAT_STACK, CONT_HIST, MOVE_STACK, PAWN_CORRECTION_HIST,
+        TT_KEY, TT_MOVE, TT_SCORE, TT_DEPTH, TT_TYPE, HISTORY, CAP_HIST, GAME_HISTORY, GAME_HISTORY_LEN, KILLERS
     )
     unmake_move(bb, sq, st, move, HIST, 0)
 
