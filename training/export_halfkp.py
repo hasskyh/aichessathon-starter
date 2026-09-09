@@ -23,8 +23,8 @@ WEIGHT_SCALE = 2 ** HIDDEN_SHIFT        # 64
 OUTPUT_SCALE = ACT_MAX * WEIGHT_SCALE   # 8128
 
 
-def load_checkpoint(path: Path, hidden: int) -> NNUE:
-    model = NNUE(hidden=hidden)
+def load_checkpoint(path: Path, hidden: int, outputs: int) -> NNUE:
+    model = NNUE(hidden=hidden, outputs=outputs)
     result = model.load_state_dict(torch.load(path, map_location="cpu"), strict=False)
     if result.missing_keys or result.unexpected_keys:
         print(f"  load_state_dict: missing={result.missing_keys} "
@@ -40,6 +40,17 @@ def quantize(model: NNUE) -> dict[str, np.ndarray]:
     b1 = np.clip(
         np.round(model.bias1.detach().numpy() * ACT_MAX / ACCUMULATOR_NORM), -32768, 32767
     ).astype(np.int16)
+
+    if model.hidden is None:
+        # Flat architecture (train_halfkp.py --outputs 0): no hidden layer, so
+        # model.output is a single Linear(2*hidden, 1) applied directly to the
+        # clamped accumulator -- see export.py's own quantize() for the identical
+        # 768-net case and nnue_halfkp.forward_flat for the runtime side of this.
+        w3 = np.clip(
+            np.round(model.output.weight.detach().numpy().squeeze(0) * WEIGHT_SCALE), -127, 127
+        ).astype(np.int8)
+        b3 = np.int32(round(model.output.bias.item() * OUTPUT_SCALE))
+        return {"w1": w1, "b1": b1, "w3": w3, "b3": b3}
 
     w2 = np.ascontiguousarray(np.clip(
         np.round(model.hidden.weight.detach().numpy().T * WEIGHT_SCALE), -127, 127
@@ -79,14 +90,18 @@ def verify(
 
     quant_pred = np.zeros(n_samples)
     hidden = weights["w1"].shape[1]
+    is_flat = "w2" not in weights
     for k, row_id in enumerate(sample_ids):
         acc = np.zeros((nnue_halfkp.PERSPECTIVES, hidden), dtype=np.int32)
         nnue_halfkp.refresh(
             acc, weights["w1"], weights["b1"], np.array(idx[row_id], dtype=np.int32, order="C")
         )
-        total = nnue_halfkp.forward(
-            acc, 0, weights["w2"], weights["b2"], weights["w3"], weights["b3"]
-        )
+        if is_flat:
+            total = nnue_halfkp.forward_flat(acc, 0, weights["w3"], weights["b3"])
+        else:
+            total = nnue_halfkp.forward(
+                acc, 0, weights["w2"], weights["b2"], weights["w3"], weights["b3"]
+            )
         quant_pred[k] = 1.0 / (1.0 + np.exp(-total / OUTPUT_SCALE))
 
     diff = np.abs(float_pred - quant_pred)
@@ -98,12 +113,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Quantise and export the HalfKP NNUE.")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--hidden", type=int, default=256, help="must match the checkpoint")
+    parser.add_argument("--outputs", type=int, default=32, help="0 for the flat architecture; must match the checkpoint")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--out-dir", type=Path, default=Path("weights_halfkp"))
     parser.add_argument("--verify-samples", type=int, default=500)
     args = parser.parse_args()
 
-    model = load_checkpoint(args.checkpoint, args.hidden)
+    model = load_checkpoint(args.checkpoint, args.hidden, args.outputs)
     weights = quantize(model)
     save_weights(weights, args.out_dir)
 

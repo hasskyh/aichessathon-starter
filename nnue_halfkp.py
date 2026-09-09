@@ -124,6 +124,32 @@ def forward(acc, stm, w2, b2, w3, b3):  # type: ignore[no-untyped-def]
     return total
 
 
+# acc: int32[2, HIDDEN]   stm: 0 white to move, 1 black
+# w3: int8[2 * HIDDEN]   b3: int32
+_FORWARD_FLAT_SIG = "int32(int32[:, ::1], int64, int8[::1], int32)"
+
+
+@njit(_FORWARD_FLAT_SIG, cache=False, fastmath=False)
+def forward_flat(acc, stm, w3, b3):  # type: ignore[no-untyped-def]
+    """Score the position for a flat (no hidden layer) net: w3/b3 applied directly
+    to the clamped accumulator, skipping forward()'s hidden stage entirely.
+
+    Byte-for-byte the same computation as nnue_768.forward_flat -- see that
+    module's docstring for how this relates to forward() above.
+    """
+    half = acc.shape[1]
+    other = 1 - stm
+
+    total = b3
+    for i in range(2 * half):
+        raw = acc[stm, i] if i < half else acc[other, i - half]
+        if raw <= 0:
+            continue
+        activation = ACT_MAX if raw > ACT_MAX else raw
+        total += activation * w3[i]
+    return total
+
+
 def _warm() -> None:
     """Pay numba's compilation cost at import, inside the 60 second init budget."""
     acc = np.zeros((PERSPECTIVES, HIDDEN), dtype=np.int32)
@@ -138,6 +164,8 @@ def _warm() -> None:
     b2 = np.zeros(OUTPUTS, dtype=np.int32)
     w3 = np.zeros(OUTPUTS, dtype=np.int8)
     forward(acc, 0, w2, b2, w3, 0)
+    w3_flat = np.zeros(PERSPECTIVES * HIDDEN, dtype=np.int8)
+    forward_flat(acc, 0, w3_flat, 0)
 
 
 _warm()
